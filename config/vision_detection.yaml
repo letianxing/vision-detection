@@ -1,0 +1,55 @@
+vision_detection:
+  ros__parameters:
+    source_type: camera
+    camera_index: 0
+    camera_width: 1280
+    camera_height: 720
+    camera_fps: 15.0
+    camera_probe_count: 8
+    image_topic: /camera/image_raw
+    video_path: ""
+
+    yolo_model_path: models/yolov8n.onnx
+    face_detector_model_path: models/face_detection_yunet_2023mar.onnx
+    face_recognizer_model_path: models/face_recognition_sface_2021dec.onnx
+    emotion_model_path: models/emotion-ferplus-12-int8.onnx
+    gesture_model_path: ""
+    identity_store_path: config/identities.yml
+
+    object_confidence_threshold: 0.35
+    object_nms_threshold: 0.45
+    object_input_width: 640
+    object_input_height: 640
+    gesture_confidence_threshold: 0.35
+    gesture_nms_threshold: 0.45
+    gesture_labels: ["wave", "invite", "reject"]
+    emotion_smoothing_alpha: 0.25
+    emotion_min_face_area_ratio: 0.01
+    emotion_max_abs_yaw_deg: 35.0
+    emotion_max_abs_pitch_deg: 30.0
+    emotion_min_face_score: 0.85
+    face_score_threshold: 0.8
+    face_nms_threshold: 0.3
+    face_top_k: 5000
+    identity_threshold: 0.38
+    near_person_min_area_ratio: 0.12
+    novelty_labels: ["cat", "dog", "bottle"]
+    publish_annotated_image: true
+    use_advanced_emotion: true
+    advanced_emotion_topic: /vision/advanced_emotion
+    advanced_emotion_max_age_sec: 1.5
+    use_advanced_gestures: true
+    advanced_gesture_events_topic: /vision/gesture_events_advanced
+    advanced_gesture_max_age_sec: 1.5
+
+    signals_topic: /vision/signals
+    camera_list_topic: /vision/available_cameras
+    near_human_topic: /vision/near_human_present
+    emotion_topic: /vision/v_user_raw
+    novelty_topic: /vision/novelty_present
+    face_orientation_topic: /vision/face_orient
+    gesture_events_topic: /vision/gesture_events
+    annotated_image_topic: /vision/annotated_image
+
+    enroll_user_id: owner
+    enroll_user_role: owner

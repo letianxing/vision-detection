@@ -1,0 +1,7 @@
+string source_type
+int32 camera_index
+string image_topic
+string video_path
+---
+bool success
+string message

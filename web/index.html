@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vision Detection Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="video-pane">
+        <div class="topbar">
+          <div>
+            <h1>Vision Detection</h1>
+            <p id="connectionStatus">connecting</p>
+          </div>
+          <div class="status-pill" id="humanPill">near human: --</div>
+        </div>
+        <div class="video-frame">
+          <img id="cameraStream" src="/stream.mjpg" alt="camera stream" />
+        </div>
+      </section>
+
+      <section class="signal-pane">
+        <div class="metric-row">
+          <span>v_user_raw smoothed</span>
+          <strong id="emotionValue">0.00</strong>
+        </div>
+        <div class="emotion-track">
+          <div id="emotionNeedle"></div>
+        </div>
+
+        <div class="grid emotion-grid">
+          <div class="metric">
+            <span>raw</span>
+            <strong id="emotionRawValue">0.00</strong>
+          </div>
+          <div class="metric">
+            <span>label</span>
+            <strong id="emotionLabel">none</strong>
+          </div>
+          <div class="metric">
+            <span>confidence</span>
+            <strong id="emotionConfidence">0%</strong>
+          </div>
+          <div class="metric">
+            <span>quality</span>
+            <strong id="emotionQuality">invalid</strong>
+          </div>
+          <div class="metric">
+            <span>arousal</span>
+            <strong id="emotionArousal">0.00</strong>
+          </div>
+          <div class="metric">
+            <span>backend</span>
+            <strong id="emotionBackend">none</strong>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div class="metric">
+            <span>user</span>
+            <strong id="userValue">none</strong>
+          </div>
+          <div class="metric">
+            <span>role</span>
+            <strong id="roleValue">none</strong>
+          </div>
+          <div class="metric">
+            <span>people</span>
+            <strong id="personCount">0</strong>
+          </div>
+          <div class="metric">
+            <span>area</span>
+            <strong id="areaRatio">0%</strong>
+          </div>
+        </div>
+
+        <div class="orientation">
+          <h2>face_orient</h2>
+          <div class="axis-row"><span>yaw</span><strong id="yawValue">--</strong></div>
+          <div class="axis-row"><span>pitch</span><strong id="pitchValue">--</strong></div>
+          <div class="axis-row"><span>roll</span><strong id="rollValue">--</strong></div>
+        </div>
+
+        <div class="list-block">
+          <h2>novelty</h2>
+          <div id="noveltyList" class="chip-list"></div>
+        </div>
+
+        <div class="list-block">
+          <h2>gestures</h2>
+          <div id="gestureList" class="event-list"></div>
+        </div>
+      </section>
+
+      <aside class="control-pane">
+        <h2>input</h2>
+        <div class="segmented">
+          <button class="active" data-source="camera">local</button>
+          <button data-source="ros_topic">ROS topic</button>
+          <button data-source="video_file">file</button>
+        </div>
+
+        <label>
+          camera
+          <select id="cameraSelect"></select>
+        </label>
+
+        <label>
+          image topic
+          <input id="topicInput" value="/camera/image_raw" />
+        </label>
+
+        <label>
+          video file
+          <input id="videoInput" placeholder="/path/to/video.mp4" />
+        </label>
+
+        <button id="connectButton" class="primary">Connect</button>
+        <p id="connectMessage" class="message"></p>
+      </aside>
+    </main>
+    <script src="/index.js"></script>
+  </body>
+</html>

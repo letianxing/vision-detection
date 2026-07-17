@@ -1,0 +1,8 @@
+std_msgs/Header header
+float32 v_user_raw
+float32 v_user_raw_raw
+string emotion_label
+float32 emotion_confidence
+float32 emotion_arousal
+bool emotion_valid
+string emotion_backend
