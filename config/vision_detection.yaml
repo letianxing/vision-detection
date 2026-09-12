@@ -5,14 +5,22 @@ vision_detection:
     camera_width: 1280
     camera_height: 720
     camera_fps: 15.0
+    camera_horizontal_fov_deg: 70.0
+    camera_vertical_fov_deg: 43.0
     camera_probe_count: 8
     image_topic: /camera/image_raw
+    depth_topic: ""
+    imu_topic: ""
+    depth_scale: 0.001
+    depth_max_age_ms: 150
+    depth_source: ros_depth_topic
     video_path: ""
 
     yolo_model_path: models/yolov8n.onnx
     face_detector_model_path: models/face_detection_yunet_2023mar.onnx
     face_recognizer_model_path: models/face_recognition_sface_2021dec.onnx
     emotion_model_path: models/emotion-ferplus-12-int8.onnx
+    use_builtin_emotion: false
     gesture_model_path: ""
     identity_store_path: config/identities.yml
 
@@ -50,6 +58,7 @@ vision_detection:
     face_orientation_topic: /vision/face_orient
     gesture_events_topic: /vision/gesture_events
     annotated_image_topic: /vision/annotated_image
+    people_topic: /vision/people
 
     enroll_user_id: owner
     enroll_user_role: owner

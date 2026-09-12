@@ -16,7 +16,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import Image
-from vision_detection.msg import CameraList, VisionSignals
+from vision_detection.msg import CameraList, PeopleSignals, VisionSignals
 from vision_detection.srv import SetInputSource
 
 try:
@@ -68,6 +68,39 @@ def signals_to_dict(msg):
     }
 
 
+def people_to_list(msg):
+    return [
+        {
+            "person_id": person.person_id,
+            "role": person.role,
+            "face_id": person.face_id,
+            "body_id": person.body_id,
+            "voice_id": person.voice_id,
+            "has_azimuth": bool(person.has_azimuth),
+            "azimuth_deg": float(person.azimuth_deg),
+            "has_elevation": bool(person.has_elevation),
+            "elevation_deg": float(person.elevation_deg),
+            "has_distance": bool(person.has_distance),
+            "distance_m": float(person.distance_m),
+            "face_visible": bool(person.face_visible),
+            "face_confidence": float(person.face_confidence),
+            "gaze_score": float(person.gaze_score),
+            "body_facing_score": float(person.body_facing_score),
+            "bbox_area_ratio": float(person.bbox_area_ratio),
+            "engagement_status": person.engagement_status,
+            "proxemic_space": person.proxemic_space,
+            "identity_confidence": float(person.identity_confidence),
+            "emotion_valence": float(person.emotion_valence),
+            "emotion_arousal": float(person.emotion_arousal),
+            "emotion_valid": bool(person.emotion_valid),
+            "emotion_label": person.emotion_label,
+            "gesture": person.gesture,
+            "gesture_score": float(person.gesture_score),
+        }
+        for person in msg.people
+    ]
+
+
 def camera_list_to_dict(msg):
     return {
         "stamp": stamp_to_float(msg.header.stamp),
@@ -90,6 +123,7 @@ class DashboardBridge(Node):
         self._loop = None
         self._websockets = set()
         self._latest_state = None
+        self._latest_people = []
         self._latest_cameras = {"stamp": 0.0, "cameras": []}
         self._latest_jpeg = None
         self._image_seq = 0
@@ -103,6 +137,7 @@ class DashboardBridge(Node):
         )
 
         self.create_subscription(VisionSignals, "/vision/signals", self._on_signals, 10)
+        self.create_subscription(PeopleSignals, "/vision/people", self._on_people, 10)
         self.create_subscription(CameraList, "/vision/available_cameras", self._on_cameras, camera_qos)
         self.create_subscription(Image, "/vision/annotated_image", self._on_image, 10)
         self._set_input_client = self.create_client(SetInputSource, "/vision/set_input_source")
@@ -112,7 +147,11 @@ class DashboardBridge(Node):
 
     def snapshot_state(self):
         with self._lock:
-            return self._latest_state
+            if self._latest_state is None:
+                return None
+            state = dict(self._latest_state)
+            state["people"] = list(self._latest_people)
+            return state
 
     def snapshot_cameras(self):
         with self._lock:
@@ -157,8 +196,20 @@ class DashboardBridge(Node):
     def _on_signals(self, msg):
         payload = signals_to_dict(msg)
         with self._lock:
+            payload["people"] = list(self._latest_people)
             self._latest_state = payload
         self._broadcast({"type": "state", "state": payload})
+
+    def _on_people(self, msg):
+        payload = people_to_list(msg)
+        with self._lock:
+            self._latest_people = payload
+            if self._latest_state is not None:
+                self._latest_state["people"] = payload
+                state = dict(self._latest_state)
+            else:
+                state = {"stamp": stamp_to_float(msg.header.stamp), "people": payload}
+        self._broadcast({"type": "state", "state": state})
 
     def _on_cameras(self, msg):
         payload = camera_list_to_dict(msg)

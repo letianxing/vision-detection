@@ -193,7 +193,8 @@ label,
 }
 
 .chip-list,
-.event-list {
+.event-list,
+.people-list {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -208,6 +209,31 @@ label,
   padding: 7px 9px;
   border-radius: 6px;
   font-size: 13px;
+}
+
+.people-list {
+  display: grid;
+}
+
+.person-item {
+  border: 1px solid #364642;
+  background: #172021;
+  border-radius: 6px;
+  padding: 9px;
+  display: grid;
+  gap: 4px;
+}
+
+.person-item strong {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.person-item strong span,
+.person-item small {
+  color: #a9bbb7;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .control-pane {

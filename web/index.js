@@ -84,6 +84,25 @@ function updateState(payload) {
       gestures.appendChild(eventItem(`${event.user_role}:${event.gesture} ${formatNumber(event.score, 2)}`));
     });
   }
+
+  const people = $("peopleList");
+  people.innerHTML = "";
+  const personItems = payload.people || [];
+  if (!personItems.length) {
+    people.appendChild(eventItem("none"));
+  } else {
+    personItems.forEach((person) => {
+      const item = document.createElement("div");
+      item.className = "person-item";
+      const az = person.has_azimuth ? `${formatNumber(person.azimuth_deg, 1)} deg` : "--";
+      item.innerHTML = `
+        <strong>${person.person_id || "unknown"} <span>${person.role || "unknown"}</span></strong>
+        <small>az ${az} · gaze ${formatNumber(person.gaze_score, 2)} · facing ${formatNumber(person.body_facing_score, 2)}</small>
+        <small>${person.engagement_status || "unknown"} · ${person.proxemic_space || "unknown"} · ${person.gesture || "none"}</small>
+      `;
+      people.appendChild(item);
+    });
+  }
 }
 
 function chip(text) {

@@ -14,6 +14,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from aiohttp import WSMsgType, web
+from aiohttp.client_exceptions import ClientConnectionResetError
+
+from capture_sources import create_capture_source, list_realsense_sources
 
 try:
     import mediapipe as mp
@@ -139,6 +142,7 @@ class HandGestureRecognizer:
         self.last_score = 0.0
         self.last_seen = 0.0
         self.last_active_at = 0.0
+        self.last_debug = {}
         if mp is None or mp_python is None or mp_vision is None or not Path(model_path).exists():
             return
 
@@ -233,8 +237,9 @@ class HandGestureRecognizer:
         return [item for item in self.history if now - item["t"] <= seconds]
 
     def _classify(self):
-        samples = self._recent(2.0)
+        samples = self._recent(1.8)
         if len(samples) < 5:
+            self.last_debug = {"samples": len(samples)}
             return None, 0.0
 
         xs = np.array([item["x"] for item in samples], dtype=np.float32)
@@ -249,6 +254,7 @@ class HandGestureRecognizer:
         open_range = float(opens.max() - opens.min())
         z_range = float(tip_z.max() - tip_z.min())
         area_range = float(areas.max() - areas.min())
+        open_count_range = float(open_counts.max() - open_counts.min())
         area_start = float(np.median(areas[: max(2, len(areas) // 4)]))
         area_end = float(np.median(areas[-max(2, len(areas) // 4):]))
         area_growth = area_end / max(area_start, 1e-4)
@@ -258,33 +264,69 @@ class HandGestureRecognizer:
         )
         median_open = float(np.median(opens))
         median_open_count = float(np.median(open_counts))
+        median_area = float(np.median(areas))
 
         wave_turns = self._turn_count(xs, min_delta=0.010)
         curl_turns = self._turn_count(opens, min_delta=0.025)
         z_turns = self._turn_count(tip_z, min_delta=0.018)
+        area_turns = self._turn_count(areas, min_delta=0.010)
 
-        if x_range > 0.045 and wave_turns >= 1 and y_range < 0.32 and median_open_count >= 3:
+        self.last_debug = {
+            "samples": len(samples),
+            "x_range": x_range,
+            "y_range": y_range,
+            "open_range": open_range,
+            "open_count_range": open_count_range,
+            "z_range": z_range,
+            "area_range": area_range,
+            "area_growth": area_growth,
+            "median_area": median_area,
+            "median_open": median_open,
+            "median_open_count": median_open_count,
+            "recent_xy_motion": recent_xy_motion,
+            "wave_turns": wave_turns,
+            "curl_turns": curl_turns,
+            "z_turns": z_turns,
+            "area_turns": area_turns,
+        }
+
+        if x_range > 0.040 and wave_turns >= 1 and y_range < 0.35 and median_open_count >= 3:
             score = clamp((x_range / 0.14) + (0.10 * wave_turns), 0.35, 1.0)
             return "hi", score
 
+        invite_motion = (
+            open_range > 0.08 or
+            open_count_range >= 1.0 or
+            z_range > 0.020 or
+            area_range > 0.025
+        )
         if (
-            area_growth > 1.10
-            and recent_area_std < 0.012
-            and recent_xy_motion < 0.035
-            and median_open_count >= 3
-            and median_open > 1.12
+            invite_motion
+            and (curl_turns >= 1 or z_turns >= 1 or area_turns >= 1 or open_range > 0.12)
+            and x_range < 0.26
+            and y_range < 0.35
         ):
-            score = clamp((area_growth - 1.0) / 0.35, 0.35, 1.0)
-            return "reject", score
+            score = clamp(
+                (open_range / 0.24) +
+                (open_count_range * 0.18) +
+                (z_range / 0.07) +
+                (area_range / 0.10),
+                0.35,
+                1.0,
+            )
+            return "invite", score
 
         if (
-            (open_range > 0.10 or z_range > 0.025 or area_range > 0.035)
-            and (curl_turns >= 1 or z_turns >= 1 or open_range > 0.16)
-            and x_range < 0.24
-            and y_range < 0.32
+            median_open_count >= 3
+            and median_open > 1.10
+            and recent_xy_motion < 0.040
+            and open_range < 0.12
+            and x_range < 0.12
+            and y_range < 0.18
+            and (area_growth > 1.08 or median_area > 0.030)
         ):
-            score = clamp((open_range / 0.28) + (z_range / 0.08) + (0.08 * curl_turns), 0.35, 1.0)
-            return "invite", score
+            score = clamp(((area_growth - 1.0) / 0.25) + (median_area / 0.10), 0.35, 1.0)
+            return "reject", score
 
         return None, 0.0
 
@@ -317,11 +359,17 @@ class LocalVisionRuntime:
         pyfeat_interval=1.2,
         camera_width=960,
         camera_height=540,
+        yolo_size=640,
+        object_interval=0.5,
+        source_type="opencv",
+        source_id="",
     ):
         self.root = Path(root)
         self.lock = threading.Lock()
         self.running = False
         self.camera_index = camera_index
+        self.source_type = source_type
+        self.source_id = str(source_id or camera_index)
         self.camera_width = int(camera_width)
         self.camera_height = int(camera_height)
         self.websockets = set()
@@ -329,6 +377,8 @@ class LocalVisionRuntime:
         self.latest_state = None
         self.latest_jpeg = None
         self.latest_frame = None
+        self.latest_depth = None
+        self.latest_depth_source = "none"
         self.latest_detections = []
         self.latest_faces = []
         self.latest_hands = []
@@ -341,19 +391,35 @@ class LocalVisionRuntime:
         self.inference_interval = 1.0 / max(float(inference_fps), 0.2)
         self.jpeg_quality = int(clamp(int(jpeg_quality), 45, 95))
         self.emotion_backend = emotion_backend
+        self.emotion_net = None
         self.pyfeat_detector = None
         self.pyfeat_ready = False
         self.pyfeat_last_result = None
         self.pyfeat_last_at = 0.0
         self.pyfeat_interval = max(float(pyfeat_interval), 0.2)
+        self.object_interval = max(float(object_interval), 0.05)
+        self.last_object_at = 0.0
+        self.cached_detections = []
+        self.previous_mouth_rois = {}
+        self.face_tracks = {}
+        self.next_face_track_id = 1
+        self.identity_store_path = self.root / "config" / "identities.local.json"
+        self.identities = self.load_identities()
 
         model_dir = self.root / "models"
-        self.object_detector = YoloDetector(model_dir / "yolov8n.onnx", COCO_LABELS)
+        self.object_detector = YoloDetector(model_dir / "yolov8n.onnx", COCO_LABELS, size=int(yolo_size))
         self.face_detector = cv2.FaceDetectorYN_create(
             str(model_dir / "face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.8, 0.3, 5000
         )
-        self.emotion_net = cv2.dnn.readNetFromONNX(str(model_dir / "emotion-ferplus-12-int8.onnx"))
+        recognizer_path = model_dir / "face_recognition_sface_2021dec.onnx"
+        self.face_recognizer = (
+            cv2.FaceRecognizerSF_create(str(recognizer_path), "")
+            if recognizer_path.exists() and hasattr(cv2, "FaceRecognizerSF_create")
+            else None
+        )
         self.hand_gestures = HandGestureRecognizer(model_dir / "hand_landmarker.task")
+        if self.emotion_backend == "ferplus":
+            self.emotion_net = cv2.dnn.readNetFromONNX(str(model_dir / "emotion-ferplus-12-int8.onnx"))
         self.load_pyfeat()
 
     def load_pyfeat(self):
@@ -367,7 +433,7 @@ class LocalVisionRuntime:
             print("py-feat valence backend ready", flush=True)
         except Exception as exc:
             self.pyfeat_ready = False
-            print(f"py-feat unavailable, falling back to FER+: {exc}", flush=True)
+            print(f"py-feat unavailable; emotion will be invalid until py-feat loads: {exc}", flush=True)
 
     def scan_cameras(self):
         cameras = []
@@ -375,9 +441,10 @@ class LocalVisionRuntime:
             cap = cv2.VideoCapture(index)
             if cap.isOpened():
                 cameras.append(
-                    {"index": index, "name": f"Local camera {index}", "source_type": "camera", "available": True}
+                    {"index": index, "name": f"Local camera {index}", "source_type": "opencv", "available": True, "depth": False}
                 )
             cap.release()
+        cameras.extend(list_realsense_sources())
         return cameras
 
     def start(self):
@@ -389,13 +456,30 @@ class LocalVisionRuntime:
         self.capture_thread.start()
         self.inference_thread.start()
 
+    def stop(self):
+        self.running = False
+        capture_thread = getattr(self, "capture_thread", None)
+        inference_thread = getattr(self, "inference_thread", None)
+        if capture_thread is not None:
+            capture_thread.join(timeout=1.0)
+        if inference_thread is not None:
+            inference_thread.join(timeout=1.0)
+        with self.lock:
+            self.latest_frame = None
+            self.latest_depth = None
+            self.latest_jpeg = None
+            self.latest_state = None
+
     def attach_loop(self, loop):
         self.loop = loop
 
-    def connect_camera(self, camera_index):
+    def connect_camera(self, camera_index, source_type="opencv"):
         with self.lock:
-            self.camera_index = int(camera_index)
-        return {"success": True, "message": f"switching to local camera {camera_index}"}
+            self.source_type = "realsense" if source_type == "realsense" else "opencv"
+            self.source_id = str(camera_index)
+            if self.source_type == "opencv":
+                self.camera_index = int(camera_index)
+        return {"success": True, "message": f"switching to {self.source_type} source {camera_index}"}
 
     def snapshot_state(self):
         with self.lock:
@@ -406,30 +490,42 @@ class LocalVisionRuntime:
             return self.image_seq, self.latest_jpeg
 
     def capture_loop(self):
-        active_index = None
-        cap = None
+        active_key = None
+        source = None
         while self.running:
             loop_start = time.time()
             with self.lock:
-                desired_index = self.camera_index
-            if cap is None or desired_index != active_index:
-                if cap is not None:
-                    cap.release()
-                cap = cv2.VideoCapture(desired_index)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_height)
-                active_index = desired_index
-            if not cap.isOpened():
+                desired_key = (self.source_type, self.source_id)
+            if source is None or desired_key != active_key:
+                if source is not None:
+                    source.release()
+                try:
+                    source = create_capture_source(
+                        desired_key[0], desired_key[1], self.camera_width, self.camera_height
+                    )
+                except Exception as exc:
+                    print(f"capture source unavailable: {exc}", flush=True)
+                    source = None
+                    time.sleep(0.5)
+                    continue
+                active_key = desired_key
+            if not source.is_opened():
                 time.sleep(0.5)
                 continue
-            ok, frame = cap.read()
-            if not ok or frame is None:
+            ok, sample = source.read()
+            if not ok or sample is None:
                 time.sleep(0.05)
                 continue
+            frame = sample.color_bgr
             frame = self.resize_frame(frame)
+            depth = sample.depth_m
+            if depth is not None and depth.shape[:2] != frame.shape[:2]:
+                depth = cv2.resize(depth, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
 
             with self.lock:
                 self.latest_frame = frame.copy()
+                self.latest_depth = None if depth is None else depth.copy()
+                self.latest_depth_source = sample.depth_source
                 detections = list(self.latest_detections)
                 faces = list(self.latest_faces)
                 hands = list(self.latest_hands)
@@ -459,11 +555,13 @@ class LocalVisionRuntime:
             loop_start = time.time()
             with self.lock:
                 frame = None if self.latest_frame is None else self.latest_frame.copy()
+                depth = None if self.latest_depth is None else self.latest_depth.copy()
+                depth_source = self.latest_depth_source
             if frame is None:
                 time.sleep(0.05)
                 continue
 
-            state, detections, faces, hand_result = self.process_frame(frame)
+            state, detections, faces, hand_result = self.process_frame(frame, depth, depth_source)
             with self.lock:
                 self.latest_state = state
                 self.latest_detections = detections
@@ -473,11 +571,17 @@ class LocalVisionRuntime:
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, self.inference_interval - elapsed))
 
-    def process_frame(self, frame):
-        detections = self.object_detector.detect(frame)
+    def process_frame(self, frame, depth=None, depth_source="none"):
+        now = time.time()
+        if now - self.last_object_at >= self.object_interval:
+            detections = self.object_detector.detect(frame)
+            self.cached_detections = detections
+            self.last_object_at = now
+        else:
+            detections = list(self.cached_detections)
         faces = self.detect_faces(frame)
         hand_result = self.hand_gestures.detect(frame)
-        state = self.compute_state(frame, detections, faces, hand_result["events"])
+        state = self.compute_state(frame, detections, faces, hand_result["events"], depth, depth_source)
         return state, detections, faces, hand_result
 
     def detect_faces(self, frame):
@@ -492,39 +596,216 @@ class LocalVisionRuntime:
             landmarks = [(float(row[i]), float(row[i + 1])) for i in range(4, 14, 2)]
             orient = self.estimate_orientation(box, landmarks)
             emotion = self.emotion_result(frame, box)
+            identity = self.identify_face(frame, row)
             results.append(
                 {
                     "box": box,
                     "score": float(row[14]),
-                    "user_id": "stranger",
-                    "user_role": "stranger",
+                    "user_id": identity["user_id"],
+                    "user_role": identity["user_role"],
+                    "identity_similarity": identity["similarity"],
                     "emotion_raw": emotion["score"],
                     "emotion_label": emotion["label"],
                     "emotion_confidence": emotion["confidence"],
                     "emotion_arousal": emotion.get("arousal", 0.0),
-                    "emotion_backend": emotion.get("backend", "ferplus"),
+                    "emotion_backend": emotion.get("backend", self.emotion_backend),
+                    "emotion_model_valid": emotion.get("valid", True),
                     "orientation": orient,
+                    "_landmarks": landmarks,
+                    "_row": [float(value) for value in row],
                 }
             )
         results.sort(key=lambda face: face["box"][2] * face["box"][3], reverse=True)
+        self.assign_face_tracks(results)
+        for face in results:
+            mouth = self.mouth_features(frame, face["box"], face["_landmarks"], face["track_id"])
+            face.update(mouth)
         return results
+
+    def load_identities(self):
+        try:
+            data = json.loads(self.identity_store_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+
+    def save_identities(self):
+        self.identity_store_path.parent.mkdir(parents=True, exist_ok=True)
+        self.identity_store_path.write_text(
+            json.dumps(self.identities, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def face_embedding(self, frame, face_row):
+        if self.face_recognizer is None:
+            return None
+        try:
+            aligned = self.face_recognizer.alignCrop(frame, np.asarray(face_row, dtype=np.float32))
+            feature = self.face_recognizer.feature(aligned)
+            vector = np.asarray(feature, dtype=np.float32).reshape(-1)
+            norm = float(np.linalg.norm(vector))
+            return (vector / norm).tolist() if norm > 1e-6 else None
+        except Exception:
+            return None
+
+    def identify_face(self, frame, face_row):
+        embedding = self.face_embedding(frame, face_row)
+        if embedding is None:
+            return {"user_id": "stranger", "user_role": "stranger", "similarity": 0.0}
+        vector = np.asarray(embedding, dtype=np.float32)
+        best = ("stranger", "stranger", 0.0)
+        for user_id, entry in self.identities.items():
+            saved = np.asarray(entry.get("embedding", []), dtype=np.float32)
+            if saved.size != vector.size:
+                continue
+            similarity = float(np.dot(vector, saved) / (np.linalg.norm(saved) + 1e-6))
+            if similarity > best[2]:
+                best = (user_id, str(entry.get("role") or "known"), similarity)
+        threshold = 0.38
+        if best[2] < threshold:
+            return {"user_id": "stranger", "user_role": "stranger", "similarity": best[2]}
+        return {"user_id": best[0], "user_role": best[1], "similarity": best[2]}
+
+    def enroll_nearest_face(self, user_id, user_role="known"):
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return {"success": False, "message": "user_id is required"}
+        with self.lock:
+            frame = None if self.latest_frame is None else self.latest_frame.copy()
+            faces = list(self.latest_faces)
+        if frame is None or not faces:
+            return {"success": False, "message": "no face is available"}
+        face = faces[0]
+        embedding = self.face_embedding(frame, face.get("_row", []))
+        if embedding is None:
+            # Re-run detection to retain the original YuNet 15-value row.
+            self.face_detector.setInputSize((frame.shape[1], frame.shape[0]))
+            _, detected = self.face_detector.detect(frame)
+            if detected is not None and len(detected):
+                embedding = self.face_embedding(frame, detected[0])
+        if embedding is None:
+            return {"success": False, "message": "face recognizer is unavailable"}
+        self.identities[user_id] = {"role": str(user_role or "known"), "embedding": embedding}
+        self.save_identities()
+        return {
+            "success": True,
+            "message": f"enrolled {user_id}",
+            "user_id": user_id,
+            "user_role": str(user_role or "known"),
+            "embedding": embedding,
+            "embedding_model": "opencv-sface",
+        }
+
+    def assign_face_tracks(self, faces):
+        now = time.time()
+        available = {
+            track_id: state
+            for track_id, state in self.face_tracks.items()
+            if now - state["seen_at"] <= 2.0
+        }
+        used = set()
+        for face in faces:
+            best_id = None
+            best_score = 0.0
+            for track_id, state in available.items():
+                if track_id in used:
+                    continue
+                score = self.face_box_match_score(face["box"], state["box"])
+                if score > best_score:
+                    best_id = track_id
+                    best_score = score
+            if best_id is None or best_score < 0.28:
+                best_id = f"face_track_{self.next_face_track_id:04d}"
+                self.next_face_track_id += 1
+            face["track_id"] = best_id
+            self.face_tracks[best_id] = {"box": list(face["box"]), "seen_at": now}
+            used.add(best_id)
+        self.face_tracks = {
+            track_id: state
+            for track_id, state in self.face_tracks.items()
+            if now - state["seen_at"] <= 2.0
+        }
+
+    @staticmethod
+    def face_box_match_score(left, right):
+        lx, ly, lw, lh = left
+        rx, ry, rw, rh = right
+        intersection_w = max(0, min(lx + lw, rx + rw) - max(lx, rx))
+        intersection_h = max(0, min(ly + lh, ry + rh) - max(ly, ry))
+        intersection = intersection_w * intersection_h
+        union = max(1, lw * lh + rw * rh - intersection)
+        iou = intersection / union
+        left_center = np.asarray([lx + lw * 0.5, ly + lh * 0.5], dtype=np.float32)
+        right_center = np.asarray([rx + rw * 0.5, ry + rh * 0.5], dtype=np.float32)
+        scale = max(30.0, 0.5 * (max(lw, lh) + max(rw, rh)))
+        proximity = math.exp(-float(np.linalg.norm(left_center - right_center)) / scale)
+        return float(0.65 * iou + 0.35 * proximity)
+
+    def mouth_features(self, frame, face_box, landmarks, face_track_id):
+        x, y, w, h = face_box
+        right_mouth, left_mouth = landmarks[3], landmarks[4]
+        mouth_cx = int(round((right_mouth[0] + left_mouth[0]) * 0.5))
+        mouth_cy = int(round((right_mouth[1] + left_mouth[1]) * 0.5))
+        mouth_w = max(8, int(round(abs(left_mouth[0] - right_mouth[0]) * 1.45)))
+        mouth_h = max(6, int(round(h * 0.20)))
+        x1 = max(x, mouth_cx - mouth_w // 2)
+        x2 = min(x + w, mouth_cx + mouth_w // 2)
+        y1 = max(y, mouth_cy - mouth_h // 2)
+        y2 = min(y + h, mouth_cy + mouth_h // 2)
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return {"mouth_open_ratio": 0.0, "lip_motion": False, "mouth_roi_features": []}
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        normalized = cv2.resize(gray, (8, 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        darkness = 1.0 - float(np.mean(normalized))
+        contrast = float(np.std(normalized))
+        mouth_open_ratio = clamp((darkness * 0.45) + (contrast * 1.8), 0.0, 1.0)
+        key = str(face_track_id)
+        previous = self.previous_mouth_rois.get(key)
+        motion_score = 0.0 if previous is None else float(np.mean(np.abs(normalized - previous)))
+        self.previous_mouth_rois[key] = normalized
+        return {
+            "mouth_open_ratio": mouth_open_ratio,
+            "lip_motion": motion_score >= 0.022,
+            "mouth_motion_score": motion_score,
+            "mouth_roi_features": normalized.reshape(-1).tolist(),
+        }
 
     def emotion_result(self, frame, box):
         if self.pyfeat_ready:
             result = self.pyfeat_emotion_result(frame, box)
             if result is not None:
                 return result
+        if self.emotion_backend == "pyfeat":
+            return {
+                "score": 0.0,
+                "label": "pyfeat_unavailable",
+                "confidence": 0.0,
+                "arousal": 0.0,
+                "backend": "pyfeat",
+                "valid": False,
+            }
+
+        if self.emotion_net is None:
+            return {
+                "score": 0.0,
+                "label": "emotion_unavailable",
+                "confidence": 0.0,
+                "arousal": 0.0,
+                "backend": self.emotion_backend,
+                "valid": False,
+            }
 
         x, y, w, h = box
         face = frame[y:y + h, x:x + w]
         if face.size == 0:
-            return {"score": 0.0, "label": "unknown", "confidence": 0.0}
+            return {"score": 0.0, "label": "unknown", "confidence": 0.0, "valid": False}
         gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
         blob = cv2.dnn.blobFromImage(gray, 1.0 / 255.0, (64, 64), swapRB=False, crop=False)
         self.emotion_net.setInput(blob)
         probs = softmax(self.emotion_net.forward())
         if probs.size < 8:
-            return {"score": 0.0, "label": "unknown", "confidence": 0.0}
+            return {"score": 0.0, "label": "unknown", "confidence": 0.0, "valid": False}
         best_index = int(np.argmax(probs))
         positive = float(probs[1] + 0.35 * probs[2])
         negative = float(0.80 * probs[3] + probs[4] + 0.80 * probs[5] + 0.60 * probs[6] + 0.50 * probs[7])
@@ -534,6 +815,7 @@ class LocalVisionRuntime:
             "confidence": float(probs[best_index]),
             "arousal": 0.0,
             "backend": "ferplus",
+            "valid": True,
         }
 
     def pyfeat_emotion_result(self, frame, box):
@@ -572,12 +854,13 @@ class LocalVisionRuntime:
                 "confidence": float(clamp(confidence, 0.0, 1.0)),
                 "arousal": float(clamp(arousal, -1.0, 1.0)),
                 "backend": "pyfeat",
+                "valid": True,
             }
             self.pyfeat_last_result = result
             self.pyfeat_last_at = now
             return result
         except Exception as exc:
-            print(f"py-feat emotion failed, using FER+: {exc}", flush=True)
+            print(f"py-feat emotion failed; emotion will be invalid: {exc}", flush=True)
             self.pyfeat_ready = False
             return None
         finally:
@@ -597,7 +880,7 @@ class LocalVisionRuntime:
         pitch = clamp(((nose[1] - ((eye_cy + mouth_cy) * 0.5)) / (h * 0.25)) * 30.0, -45.0, 45.0)
         return {"valid": True, "yaw_deg": yaw, "pitch_deg": pitch, "roll_deg": roll}
 
-    def compute_state(self, frame, detections, faces, hand_events):
+    def compute_state(self, frame, detections, faces, hand_events, depth=None, depth_source="none"):
         frame_area = frame.shape[0] * frame.shape[1]
         persons = [d for d in detections if d["label"] == "person"]
         largest = max(persons, key=lambda d: d["box"][2] * d["box"][3], default=None)
@@ -623,7 +906,7 @@ class LocalVisionRuntime:
             emotion_confidence = nearest["emotion_confidence"]
             emotion_arousal = nearest["emotion_arousal"]
             emotion_backend = nearest["emotion_backend"]
-            emotion_valid = self.emotion_quality_ok(frame, nearest)
+            emotion_valid = nearest.get("emotion_model_valid", True) and self.emotion_quality_ok(frame, nearest)
             if emotion_valid:
                 if not self.emotion_ema_ready:
                     self.emotion_ema = emotion_raw
@@ -658,6 +941,7 @@ class LocalVisionRuntime:
                     "score": nearest["score"],
                 }
             )
+        people = self.compute_people(frame, persons, faces, gestures, emotion_score, emotion_raw, emotion_label, emotion_confidence, emotion_arousal, emotion_valid, depth, depth_source)
 
         return {
             "stamp": time.time(),
@@ -679,7 +963,270 @@ class LocalVisionRuntime:
             "person_count": len(persons),
             "nearest_person_score": 0.0 if largest is None else largest["score"],
             "nearest_person_bbox_area_ratio": area_ratio,
+            "people": people,
         }
+
+    def compute_people(
+        self,
+        frame,
+        person_detections,
+        faces,
+        gestures,
+        nearest_emotion_score,
+        nearest_emotion_raw,
+        nearest_emotion_label,
+        nearest_emotion_confidence,
+        nearest_emotion_arousal,
+        nearest_emotion_valid,
+        depth,
+        depth_source,
+    ):
+        people = []
+        matched = set()
+        for index, face in enumerate(faces):
+            body_index = self.matching_person_detection(person_detections, face)
+            if body_index is not None:
+                matched.add(body_index)
+            box = person_detections[body_index]["box"] if body_index is not None else face["box"]
+            area_ratio = self.area_ratio(frame, box)
+            distance_m, distance_confidence, resolved_depth_source = self.distance_for_box(
+                frame, box, depth, depth_source, is_face=True
+            )
+            gaze = self.gaze_score(face)
+            facing = self.body_facing_score(face)
+            gesture, gesture_score = self.gesture_for_face(face, gestures)
+            if index == 0:
+                emotion_valence = nearest_emotion_score
+                emotion_raw = nearest_emotion_raw
+                emotion_label = nearest_emotion_label
+                emotion_confidence = nearest_emotion_confidence
+                emotion_arousal = nearest_emotion_arousal
+                emotion_valid = nearest_emotion_valid
+            else:
+                emotion_valence = face["emotion_raw"]
+                emotion_raw = face["emotion_raw"]
+                emotion_label = face["emotion_label"]
+                emotion_confidence = face["emotion_confidence"]
+                emotion_arousal = face["emotion_arousal"]
+                emotion_valid = face.get("emotion_model_valid", True) and self.emotion_quality_ok(frame, face)
+            person_id = self.stable_person_id(face["user_id"], face["track_id"])
+            people.append(
+                {
+                    "person_id": person_id,
+                    "role": face["user_role"] or "unknown",
+                    "face_id": f"{person_id}_face_obs",
+                    "body_id": f"{person_id}_body_obs",
+                    "voice_id": "",
+                    "has_azimuth": True,
+                    "azimuth_deg": self.rect_azimuth(frame, box),
+                    "has_elevation": True,
+                    "elevation_deg": self.rect_elevation(frame, box),
+                    "has_distance": distance_m is not None,
+                    "distance_m": float(distance_m or 0.0),
+                    "distance_confidence": distance_confidence,
+                    "depth_source": resolved_depth_source,
+                    "face_visible": True,
+                    "face_confidence": clamp(face["score"], 0.0, 1.0),
+                    "mouth_open_ratio": face.get("mouth_open_ratio", 0.0),
+                    "lip_motion": face.get("lip_motion", False),
+                    "mouth_roi_features": face.get("mouth_roi_features", []),
+                    "gaze_score": gaze,
+                    "body_facing_score": facing,
+                    "bbox_area_ratio": area_ratio,
+                    "engagement_status": self.engagement_status(gaze, facing, gesture),
+                    "proxemic_space": self.proxemic_space(area_ratio, distance_m, distance_confidence),
+                    "identity_confidence": float(face.get("identity_similarity", 0.0)),
+                    "emotion_valence": emotion_valence,
+                    "emotion_raw": emotion_raw,
+                    "emotion_arousal": emotion_arousal,
+                    "emotion_valid": emotion_valid,
+                    "emotion_label": emotion_label,
+                    "emotion_confidence": emotion_confidence,
+                    "gesture": gesture,
+                    "gesture_score": gesture_score,
+                }
+            )
+        for index, detection in enumerate(person_detections):
+            if index in matched:
+                continue
+            box = detection["box"]
+            area_ratio = self.area_ratio(frame, box)
+            distance_m, distance_confidence, resolved_depth_source = self.distance_for_box(
+                frame, box, depth, depth_source, is_face=False
+            )
+            people.append(
+                {
+                    "person_id": f"vision_body_{index}",
+                    "role": "unknown",
+                    "face_id": "",
+                    "body_id": f"body_{index}",
+                    "voice_id": "",
+                    "has_azimuth": True,
+                    "azimuth_deg": self.rect_azimuth(frame, box),
+                    "has_elevation": True,
+                    "elevation_deg": self.rect_elevation(frame, box),
+                    "has_distance": distance_m is not None,
+                    "distance_m": float(distance_m or 0.0),
+                    "distance_confidence": distance_confidence,
+                    "depth_source": resolved_depth_source,
+                    "face_visible": False,
+                    "face_confidence": 0.0,
+                    "mouth_open_ratio": 0.0,
+                    "lip_motion": False,
+                    "mouth_roi_features": [],
+                    "gaze_score": 0.0,
+                    "body_facing_score": 0.25,
+                    "bbox_area_ratio": area_ratio,
+                    "engagement_status": "unengaged",
+                    "proxemic_space": self.proxemic_space(area_ratio, distance_m, distance_confidence),
+                    "identity_confidence": 0.0,
+                    "emotion_valence": 0.0,
+                    "emotion_raw": 0.0,
+                    "emotion_arousal": 0.0,
+                    "emotion_valid": False,
+                    "emotion_label": "unknown",
+                    "emotion_confidence": 0.0,
+                    "gesture": "none",
+                    "gesture_score": 0.0,
+                }
+            )
+        return people
+
+    def matching_person_detection(self, person_detections, face):
+        fx, fy, fw, fh = face["box"]
+        cx = fx + fw * 0.5
+        cy = fy + fh * 0.5
+        best_index = None
+        best_score = 0.0
+        for index, detection in enumerate(person_detections):
+            x, y, w, h = detection["box"]
+            contains = x <= cx <= x + w and y <= cy <= y + h
+            overlap_w = max(0, min(x + w, fx + fw) - max(x, fx))
+            overlap_h = max(0, min(y + h, fy + fh) - max(y, fy))
+            score = (1.0 if contains else 0.0) + overlap_w * overlap_h
+            if score > best_score:
+                best_score = score
+                best_index = index
+        return best_index
+
+    @staticmethod
+    def stable_person_id(user_id, face_track_id):
+        if user_id and user_id not in {"unknown", "stranger"}:
+            return "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in user_id)
+        return f"vision_{face_track_id}"
+
+    @staticmethod
+    def area_ratio(frame, box):
+        x, y, w, h = box
+        frame_h, frame_w = frame.shape[:2]
+        x1 = clamp(x, 0, frame_w)
+        y1 = clamp(y, 0, frame_h)
+        x2 = clamp(x + w, 0, frame_w)
+        y2 = clamp(y + h, 0, frame_h)
+        return float(max(0.0, x2 - x1) * max(0.0, y2 - y1) / max(1, frame_w * frame_h))
+
+    @staticmethod
+    def rect_azimuth(frame, box):
+        x, _y, w, _h = box
+        frame_w = frame.shape[1]
+        return float(((x + w * 0.5) / max(1, frame_w) - 0.5) * 70.0)
+
+    @staticmethod
+    def rect_elevation(frame, box):
+        _x, y, _w, h = box
+        frame_h = frame.shape[0]
+        return float((0.5 - (y + h * 0.5) / max(1, frame_h)) * 43.0)
+
+    @staticmethod
+    def gaze_score(face):
+        orient = face["orientation"]
+        if not orient.get("valid", False):
+            return 0.35 if face["score"] > 0.0 else 0.0
+        yaw_score = 1.0 - abs(float(orient["yaw_deg"])) / 60.0
+        pitch_score = 1.0 - abs(float(orient["pitch_deg"])) / 45.0
+        return float(clamp(0.75 * yaw_score + 0.25 * pitch_score, 0.0, 1.0))
+
+    @staticmethod
+    def body_facing_score(face):
+        orient = face["orientation"]
+        if not orient.get("valid", False):
+            return 0.35 if face["score"] > 0.0 else 0.25
+        return float(clamp(1.0 - abs(float(orient["yaw_deg"])) / 90.0, 0.0, 1.0))
+
+    @staticmethod
+    def proxemic_space(area_ratio, distance_m=None, distance_confidence=0.0):
+        if distance_m is not None and distance_confidence >= 0.5:
+            if distance_m < 0.45:
+                return "intimate"
+            if distance_m < 1.2:
+                return "personal"
+            if distance_m < 3.6:
+                return "social"
+            return "public"
+        if area_ratio >= 0.42:
+            return "intimate"
+        if area_ratio >= 0.20:
+            return "personal"
+        if area_ratio >= 0.06:
+            return "social"
+        if area_ratio > 0.0:
+            return "public"
+        return "unknown"
+
+    @staticmethod
+    def distance_for_box(frame, box, depth, depth_source, is_face):
+        x, y, w, h = box
+        if depth is not None:
+            margin_x = int(w * 0.25)
+            margin_y = int(h * 0.25)
+            region = depth[
+                max(0, y + margin_y) : min(depth.shape[0], y + h - margin_y),
+                max(0, x + margin_x) : min(depth.shape[1], x + w - margin_x),
+            ]
+            valid = region[(region > 0.15) & (region < 12.0)]
+            if valid.size >= 20:
+                return float(np.median(valid)), min(1.0, 0.65 + valid.size / 4000.0), depth_source
+        focal_px = frame.shape[1] / (2.0 * math.tan(math.radians(70.0) * 0.5))
+        physical_width_m = 0.16 if is_face else 0.48
+        estimate = physical_width_m * focal_px / max(1.0, float(w))
+        return float(clamp(estimate, 0.25, 8.0)), 0.18 if is_face else 0.10, "monocular_size_proxy"
+
+    @staticmethod
+    def engagement_status(gaze_score, facing_score, gesture):
+        if gaze_score >= 0.65 or gesture in {"wave", "invite", "call"}:
+            return "engaged"
+        if gaze_score >= 0.38 or facing_score >= 0.55:
+            return "engaging"
+        return "unengaged"
+
+    @staticmethod
+    def gesture_for_face(face, gestures):
+        best = ("none", 0.0)
+        for event in gestures:
+            if (
+                event["user_id"] != face["user_id"]
+                and event["user_id"] != "unknown"
+                and face["user_id"] not in {"unknown", "stranger"}
+            ):
+                continue
+            gesture = LocalVisionRuntime.normalize_gesture(event["gesture"])
+            score = clamp(event["score"], 0.0, 1.0)
+            if score >= best[1]:
+                best = (gesture, score)
+        return best
+
+    @staticmethod
+    def normalize_gesture(raw):
+        gesture = str(raw).lower()
+        if "wave" in gesture or "hi" in gesture:
+            return "wave"
+        if "invite" in gesture or "call" in gesture:
+            return "invite"
+        if "reject" in gesture or "stop" in gesture:
+            return "reject"
+        if "detected" in gesture:
+            return "detected"
+        return "none" if not raw else str(raw)
 
     def emotion_quality_ok(self, frame, face):
         h, w = frame.shape[:2]
@@ -773,10 +1320,25 @@ def make_app(runtime, web_dir):
     @routes.post("/api/connect")
     async def api_connect(request):
         data = await request.json()
-        source_type = data.get("source_type", "camera")
-        if source_type != "camera":
-            return web.json_response({"success": False, "message": "local fallback supports local camera only"})
-        return web.json_response(runtime.connect_camera(int(data.get("camera_index", 0))))
+        source_type = data.get("source_type", "opencv")
+        source_id = data.get("camera_index", data.get("source_id", 0))
+        return web.json_response(runtime.connect_camera(source_id, source_type))
+
+    @routes.post("/api/start")
+    async def api_start(_request):
+        runtime.start()
+        return web.json_response({"success": True, "message": "vision capture started"})
+
+    @routes.post("/api/stop")
+    async def api_stop(_request):
+        runtime.stop()
+        return web.json_response({"success": True, "message": "vision capture stopped"})
+
+    @routes.post("/api/enroll")
+    async def api_enroll(request):
+        data = await request.json()
+        result = runtime.enroll_nearest_face(data.get("user_id"), data.get("user_role", "known"))
+        return web.json_response(result, status=200 if result.get("success") else 400)
 
     @routes.get("/ws")
     async def websocket(request):
@@ -798,12 +1360,15 @@ def make_app(runtime, web_dir):
         )
         await response.prepare(request)
         last_seq = -1
-        while True:
-            seq, jpeg = runtime.snapshot_jpeg()
-            if jpeg is not None and seq != last_seq:
-                last_seq = seq
-                await response.write(b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii") + jpeg + b"\r\n")
-            await asyncio.sleep(0.02)
+        try:
+            while True:
+                seq, jpeg = runtime.snapshot_jpeg()
+                if jpeg is not None and seq != last_seq:
+                    last_seq = seq
+                    await response.write(b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii") + jpeg + b"\r\n")
+                await asyncio.sleep(0.02)
+        except (ClientConnectionResetError, ConnectionResetError, asyncio.CancelledError):
+            return response
 
     app = web.Application()
     app.add_routes(routes)
@@ -822,6 +1387,10 @@ async def main_async(args):
         args.pyfeat_interval,
         args.camera_width,
         args.camera_height,
+        args.yolo_size,
+        args.object_interval,
+        args.source_type,
+        args.source_id,
     )
     runtime.start()
     runtime.attach_loop(asyncio.get_running_loop())
@@ -846,6 +1415,10 @@ def main():
     parser.add_argument("--pyfeat-interval", type=float, default=1.2)
     parser.add_argument("--camera-width", type=int, default=960)
     parser.add_argument("--camera-height", type=int, default=540)
+    parser.add_argument("--yolo-size", type=int, default=640)
+    parser.add_argument("--object-interval", type=float, default=0.5)
+    parser.add_argument("--source-type", choices=["opencv", "realsense"], default="opencv")
+    parser.add_argument("--source-id", default="")
     args = parser.parse_args()
     asyncio.run(main_async(args))
 

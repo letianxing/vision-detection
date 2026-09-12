@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(hri_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
@@ -24,6 +25,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceOrientation.msg"
   "msg/GestureObservation.msg"
   "msg/GestureEvents.msg"
+  "msg/PersonObservation.msg"
+  "msg/PeopleSignals.msg"
   "msg/VisionSignals.msg"
   "srv/SetInputSource.srv"
   DEPENDENCIES std_msgs
@@ -49,7 +52,7 @@ ament_target_dependencies(vision_detection_core
   sensor_msgs
   std_msgs
 )
-target_link_libraries(vision_detection_core PUBLIC ${OpenCV_LIBS})
+target_link_libraries(vision_detection_core ${OpenCV_LIBS})
 
 add_executable(vision_detection_node src/vision_detection_node.cpp)
 target_include_directories(vision_detection_node PRIVATE ${OpenCV_INCLUDE_DIRS})
@@ -69,6 +72,7 @@ target_link_libraries(vision_detection_node
 install(PROGRAMS
   scripts/advanced_perception_node.py
   scripts/vision_dashboard.py
+  scripts/ros4hri_vision_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

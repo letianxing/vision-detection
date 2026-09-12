@@ -9,6 +9,8 @@
 #include "vision_detection/msg/face_orientation.hpp"
 #include "vision_detection/msg/gesture_observation.hpp"
 #include "vision_detection/msg/gesture_events.hpp"
+#include "vision_detection/msg/people_signals.hpp"
+#include "vision_detection/msg/person_observation.hpp"
 #include "vision_detection/msg/vision_signals.hpp"
 #include "vision_detection/srv/set_input_source.hpp"
 
@@ -30,8 +32,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vision_detection
@@ -115,14 +119,22 @@ private:
     declare_parameter<int>("camera_width", 1280);
     declare_parameter<int>("camera_height", 720);
     declare_parameter<double>("camera_fps", 15.0);
+    declare_parameter<double>("camera_horizontal_fov_deg", 70.0);
+    declare_parameter<double>("camera_vertical_fov_deg", 43.0);
     declare_parameter<int>("camera_probe_count", 8);
     declare_parameter<std::string>("image_topic", "/camera/image_raw");
+    declare_parameter<std::string>("depth_topic", "");
+    declare_parameter<std::string>("imu_topic", "");
+    declare_parameter<double>("depth_scale", 0.001);
+    declare_parameter<int>("depth_max_age_ms", 150);
+    declare_parameter<std::string>("depth_source", "ros_depth_topic");
     declare_parameter<std::string>("video_path", "");
 
     declare_parameter<std::string>("yolo_model_path", "models/yolov8n.onnx");
     declare_parameter<std::string>("face_detector_model_path", "models/face_detection_yunet_2023mar.onnx");
     declare_parameter<std::string>("face_recognizer_model_path", "models/face_recognition_sface_2021dec.onnx");
     declare_parameter<std::string>("emotion_model_path", "models/emotion-ferplus-12-int8.onnx");
+    declare_parameter<bool>("use_builtin_emotion", false);
     declare_parameter<std::string>("gesture_model_path", "");
     declare_parameter<std::string>("identity_store_path", "config/identities.yml");
 
@@ -161,6 +173,7 @@ private:
     declare_parameter<std::string>("face_orientation_topic", "/vision/face_orient");
     declare_parameter<std::string>("gesture_events_topic", "/vision/gesture_events");
     declare_parameter<std::string>("annotated_image_topic", "/vision/annotated_image");
+    declare_parameter<std::string>("people_topic", "/vision/people");
 
     declare_parameter<std::string>("enroll_user_id", "owner");
     declare_parameter<std::string>("enroll_user_role", "owner");
@@ -173,14 +186,24 @@ private:
     camera_width_ = static_cast<int>(get_parameter("camera_width").as_int());
     camera_height_ = static_cast<int>(get_parameter("camera_height").as_int());
     camera_fps_ = get_parameter("camera_fps").as_double();
+    camera_horizontal_fov_deg_ = static_cast<float>(
+      get_parameter("camera_horizontal_fov_deg").as_double());
+    camera_vertical_fov_deg_ = static_cast<float>(
+      get_parameter("camera_vertical_fov_deg").as_double());
     camera_probe_count_ = static_cast<int>(get_parameter("camera_probe_count").as_int());
     image_topic_ = get_parameter("image_topic").as_string();
+    depth_topic_ = get_parameter("depth_topic").as_string();
+    imu_topic_ = get_parameter("imu_topic").as_string();
+    depth_scale_ = static_cast<float>(get_parameter("depth_scale").as_double());
+    depth_max_age_ms_ = static_cast<int>(get_parameter("depth_max_age_ms").as_int());
+    depth_source_ = get_parameter("depth_source").as_string();
     video_path_ = get_parameter("video_path").as_string();
 
     yolo_model_path_ = get_parameter("yolo_model_path").as_string();
     face_detector_model_path_ = get_parameter("face_detector_model_path").as_string();
     face_recognizer_model_path_ = get_parameter("face_recognizer_model_path").as_string();
     emotion_model_path_ = get_parameter("emotion_model_path").as_string();
+    use_builtin_emotion_ = get_parameter("use_builtin_emotion").as_bool();
     gesture_model_path_ = get_parameter("gesture_model_path").as_string();
     identity_store_path_ = get_parameter("identity_store_path").as_string();
 
@@ -219,6 +242,7 @@ private:
     face_orientation_topic_ = get_parameter("face_orientation_topic").as_string();
     gesture_events_topic_ = get_parameter("gesture_events_topic").as_string();
     annotated_image_topic_ = get_parameter("annotated_image_topic").as_string();
+    people_topic_ = get_parameter("people_topic").as_string();
   }
 
   void loadModels()
@@ -241,7 +265,9 @@ private:
       RCLCPP_WARN(get_logger(), "Face detector not loaded: %s", face_detector_model_path_.c_str());
     }
 
-    if (emotion_classifier_.load(emotion_model_path_)) {
+    if (!use_builtin_emotion_) {
+      RCLCPP_INFO(get_logger(), "Built-in FER+ emotion model disabled");
+    } else if (emotion_classifier_.load(emotion_model_path_)) {
       RCLCPP_INFO(get_logger(), "Loaded emotion model: %s", emotion_model_path_.c_str());
     } else {
       RCLCPP_WARN(get_logger(), "Emotion model not loaded: %s", emotion_model_path_.c_str());
@@ -278,6 +304,7 @@ private:
       face_orientation_topic_, rclcpp::SensorDataQoS());
     gesture_events_pub_ = create_publisher<msg::GestureEvents>(
       gesture_events_topic_, rclcpp::SensorDataQoS());
+    people_pub_ = create_publisher<msg::PeopleSignals>(people_topic_, rclcpp::SensorDataQoS());
     if (publish_annotated_image_) {
       annotated_image_pub_ = create_publisher<sensor_msgs::msg::Image>(
         annotated_image_topic_, rclcpp::SensorDataQoS());
@@ -337,6 +364,7 @@ private:
       capture_timer_.reset();
     }
     image_sub_.reset();
+    depth_sub_.reset();
     if (capture_.isOpened()) {
       capture_.release();
     }
@@ -352,6 +380,13 @@ private:
         [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
           handleImageMessage(msg);
         });
+      if (!depth_topic_.empty()) {
+        depth_sub_ = create_subscription<sensor_msgs::msg::Image>(
+          depth_topic_, rclcpp::SensorDataQoS(),
+          [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+            handleDepthMessage(msg);
+          });
+      }
       RCLCPP_INFO(get_logger(), "Reading frames from ROS2 topic: %s", image_topic_.c_str());
       return true;
     }
@@ -459,11 +494,44 @@ private:
     }
   }
 
+  void handleDepthMessage(sensor_msgs::msg::Image::ConstSharedPtr msg)
+  {
+    try {
+      cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, msg->encoding);
+      cv::Mat depth_m;
+      if (cv_ptr->image.type() == CV_16UC1) {
+        cv_ptr->image.convertTo(depth_m, CV_32FC1, depth_scale_);
+      } else if (cv_ptr->image.type() == CV_32FC1) {
+        depth_m = cv_ptr->image.clone();
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "unsupported depth encoding: %s", msg->encoding.c_str());
+        return;
+      }
+      std::lock_guard<std::mutex> lock(depth_mutex_);
+      latest_depth_m_ = depth_m;
+      latest_depth_stamp_ = msg->header.stamp;
+    } catch (const cv_bridge::Exception & error) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000, "depth conversion failed: %s", error.what());
+    }
+  }
+
   void processFrame(const cv::Mat & frame, const rclcpp::Time & stamp, const std::string & encoding)
   {
     (void)encoding;
     if (frame.empty()) {
       return;
+    }
+
+    cv::Mat depth_m;
+    {
+      std::lock_guard<std::mutex> lock(depth_mutex_);
+      const auto age_ms = std::abs((stamp - latest_depth_stamp_).nanoseconds()) / 1000000LL;
+      if (!latest_depth_m_.empty() && age_ms <= depth_max_age_ms_) {
+        depth_m = latest_depth_m_.clone();
+      }
     }
 
     const auto detections = object_detector_.detect(frame);
@@ -480,11 +548,350 @@ private:
 
     fillObjectSignals(frame, detections, state);
     fillFaceSignals(frame, faces, gesture_detections, state);
+    const auto people = buildPeopleSignals(frame, depth_m, detections, faces, state);
     publishSignals(state);
+    publishPeople(people);
 
     if (publish_annotated_image_ && annotated_image_pub_ != nullptr) {
       publishAnnotatedImage(frame, detections, gesture_detections, faces, state.header.stamp);
     }
+  }
+
+  msg::PeopleSignals buildPeopleSignals(
+    const cv::Mat & frame, const cv::Mat & depth_m, const std::vector<Detection> & detections,
+    const std::vector<FaceObservation> & faces, const msg::VisionSignals & state) const
+  {
+    msg::PeopleSignals people;
+    people.header = state.header;
+
+    std::vector<bool> matched_body(detections.size(), false);
+    for (std::size_t index = 0; index < faces.size(); ++index) {
+      const auto body_index = matchingPersonDetectionIndex(detections, faces[index]);
+      if (body_index.has_value()) {
+        matched_body[*body_index] = true;
+      }
+      people.people.push_back(makeFacePersonObservation(
+        frame, depth_m, faces[index], index,
+        body_index.has_value() ? &detections[*body_index] : nullptr,
+        state));
+    }
+
+    for (std::size_t index = 0; index < detections.size(); ++index) {
+      const auto & detection = detections[index];
+      if (detection.label != "person" || matched_body[index]) {
+        continue;
+      }
+      people.people.push_back(makeBodyOnlyObservation(frame, depth_m, detection, index));
+    }
+
+    return people;
+  }
+
+  msg::PersonObservation makeFacePersonObservation(
+    const cv::Mat & frame, const cv::Mat & depth_m, const FaceObservation & face, std::size_t index,
+    const Detection * body_detection, const msg::VisionSignals & state) const
+  {
+    msg::PersonObservation person;
+    person.person_id = stablePersonId(face.user_id, index);
+    person.role = face.user_role.empty() ? "unknown" : face.user_role;
+    person.face_id = person.person_id + "_face_obs";
+    person.body_id = person.person_id + "_body_obs";
+    person.voice_id = "";
+
+    const cv::Rect body_box = body_detection == nullptr ? face.box : body_detection->box;
+    const float area_ratio = rectAreaRatio(frame, body_box);
+    person.has_azimuth = true;
+    person.azimuth_deg = rectAzimuth(frame, body_box);
+    person.has_elevation = true;
+    person.elevation_deg = rectElevation(frame, body_box);
+    const auto depth = depthForBox(frame, depth_m, body_box);
+    person.has_distance = depth.has_value();
+    person.distance_m = depth.has_value() ? depth->first : 0.0F;
+    person.distance_confidence = depth.has_value() ? depth->second : 0.0F;
+    person.depth_source = depth.has_value() ? depth_source_ : "none";
+    person.face_visible = true;
+    person.face_confidence = std::clamp(face.face_score, 0.0F, 1.0F);
+    person.mouth_open_ratio = 0.0F;
+    person.lip_motion = false;
+    person.mouth_roi_features.clear();
+    person.gaze_score = gazeScore(face);
+    person.body_facing_score = bodyFacingScore(face);
+    person.bbox_area_ratio = area_ratio;
+    person.proxemic_space = proxemicSpace(area_ratio);
+    person.identity_confidence = std::clamp(face.identity_similarity, 0.0F, 1.0F);
+    fillEmotionForPerson(face, index, state, person);
+
+    const auto [gesture, gesture_score] = gestureForPerson(face, state);
+    person.gesture = gesture;
+    person.gesture_score = gesture_score;
+    person.engagement_status = engagementStatus(person.gaze_score, person.body_facing_score, gesture);
+    return person;
+  }
+
+  msg::PersonObservation makeBodyOnlyObservation(
+    const cv::Mat & frame, const cv::Mat & depth_m, const Detection & detection, std::size_t index) const
+  {
+    msg::PersonObservation person;
+    person.person_id = "vision_body_" + std::to_string(index);
+    person.role = "unknown";
+    person.face_id = "";
+    person.body_id = "body_" + std::to_string(index);
+    person.voice_id = "";
+    person.has_azimuth = true;
+    person.azimuth_deg = rectAzimuth(frame, detection.box);
+    person.has_elevation = true;
+    person.elevation_deg = rectElevation(frame, detection.box);
+    const auto depth = depthForBox(frame, depth_m, detection.box);
+    person.has_distance = depth.has_value();
+    person.distance_m = depth.has_value() ? depth->first : 0.0F;
+    person.distance_confidence = depth.has_value() ? depth->second : 0.0F;
+    person.depth_source = depth.has_value() ? depth_source_ : "none";
+    person.face_visible = false;
+    person.face_confidence = 0.0F;
+    person.mouth_open_ratio = 0.0F;
+    person.lip_motion = false;
+    person.mouth_roi_features.clear();
+    person.gaze_score = 0.0F;
+    person.body_facing_score = 0.25F;
+    person.bbox_area_ratio = rectAreaRatio(frame, detection.box);
+    person.engagement_status = "unengaged";
+    person.proxemic_space = proxemicSpace(person.bbox_area_ratio);
+    person.identity_confidence = 0.0F;
+    person.emotion_valence = 0.0F;
+    person.emotion_arousal = 0.0F;
+    person.emotion_valid = false;
+    person.emotion_label = "unknown";
+    person.gesture = "none";
+    person.gesture_score = 0.0F;
+    return person;
+  }
+
+  std::optional<std::size_t> matchingPersonDetectionIndex(
+    const std::vector<Detection> & detections, const FaceObservation & face) const
+  {
+    const cv::Point2f face_center(
+      static_cast<float>(face.box.x) + (static_cast<float>(face.box.width) * 0.5F),
+      static_cast<float>(face.box.y) + (static_cast<float>(face.box.height) * 0.5F));
+    std::optional<std::size_t> best_index;
+    float best_score = -1.0F;
+
+    for (std::size_t index = 0; index < detections.size(); ++index) {
+      const auto & detection = detections[index];
+      if (detection.label != "person") {
+        continue;
+      }
+      const bool contains_center =
+        detection.box.contains(cv::Point(static_cast<int>(face_center.x), static_cast<int>(face_center.y)));
+      const cv::Rect overlap = detection.box & face.box;
+      const float overlap_area = static_cast<float>(std::max(0, overlap.area()));
+      const float score = (contains_center ? 1.0F : 0.0F) + overlap_area;
+      if (score > best_score) {
+        best_score = score;
+        best_index = index;
+      }
+    }
+
+    return best_score > 0.0F ? best_index : std::nullopt;
+  }
+
+  std::string stablePersonId(const std::string & user_id, std::size_t index) const
+  {
+    if (!user_id.empty() && user_id != "unknown" && user_id != "stranger") {
+      return sanitizeId(user_id);
+    }
+    return "vision_person_" + std::to_string(index);
+  }
+
+  std::string sanitizeId(const std::string & value) const
+  {
+    std::string out;
+    out.reserve(value.size());
+    for (const unsigned char c : value) {
+      if (std::isalnum(c) || c == '_' || c == '-') {
+        out.push_back(static_cast<char>(c));
+      } else {
+        out.push_back('_');
+      }
+    }
+    return out.empty() ? "unknown" : out;
+  }
+
+  std::optional<std::pair<float, float>> depthForBox(
+    const cv::Mat & frame, const cv::Mat & depth_m, const cv::Rect & box) const
+  {
+    if (frame.empty() || depth_m.empty() || depth_m.type() != CV_32FC1) {
+      return std::nullopt;
+    }
+    const float scale_x = static_cast<float>(depth_m.cols) / static_cast<float>(frame.cols);
+    const float scale_y = static_cast<float>(depth_m.rows) / static_cast<float>(frame.rows);
+    cv::Rect mapped(
+      static_cast<int>(std::round(static_cast<float>(box.x) * scale_x)),
+      static_cast<int>(std::round(static_cast<float>(box.y) * scale_y)),
+      std::max(1, static_cast<int>(std::round(static_cast<float>(box.width) * scale_x))),
+      std::max(1, static_cast<int>(std::round(static_cast<float>(box.height) * scale_y))));
+    mapped &= cv::Rect(0, 0, depth_m.cols, depth_m.rows);
+    const int margin_x = mapped.width / 4;
+    const int margin_y = mapped.height / 4;
+    cv::Rect center(
+      mapped.x + margin_x, mapped.y + margin_y,
+      std::max(1, mapped.width - 2 * margin_x),
+      std::max(1, mapped.height - 2 * margin_y));
+    center &= cv::Rect(0, 0, depth_m.cols, depth_m.rows);
+    std::vector<float> values;
+    values.reserve(static_cast<std::size_t>(std::max(0, center.area())));
+    for (int row = center.y; row < center.y + center.height; ++row) {
+      for (int col = center.x; col < center.x + center.width; ++col) {
+        const float value = depth_m.at<float>(row, col);
+        if (std::isfinite(value) && value >= 0.1F && value <= 10.0F) {
+          values.push_back(value);
+        }
+      }
+    }
+    if (values.size() < 20) {
+      return std::nullopt;
+    }
+    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), middle, values.end());
+    const float confidence = std::clamp(
+      static_cast<float>(values.size()) / static_cast<float>(std::max(1, center.area())),
+      0.0F, 1.0F);
+    return std::make_pair(*middle, confidence);
+  }
+
+  float rectAreaRatio(const cv::Mat & frame, const cv::Rect & rect) const
+  {
+    if (frame.empty()) {
+      return 0.0F;
+    }
+    const cv::Rect bounds(0, 0, frame.cols, frame.rows);
+    const cv::Rect clipped = rect & bounds;
+    const float frame_area = static_cast<float>(std::max(1, frame.cols * frame.rows));
+    return std::clamp(static_cast<float>(std::max(0, clipped.area())) / frame_area, 0.0F, 1.0F);
+  }
+
+  float rectAzimuth(const cv::Mat & frame, const cv::Rect & rect) const
+  {
+    if (frame.empty() || frame.cols <= 0) {
+      return 0.0F;
+    }
+    const float center_x = static_cast<float>(rect.x) + (static_cast<float>(rect.width) * 0.5F);
+    return ((center_x / static_cast<float>(frame.cols)) - 0.5F) * camera_horizontal_fov_deg_;
+  }
+
+  float rectElevation(const cv::Mat & frame, const cv::Rect & rect) const
+  {
+    if (frame.empty() || frame.rows <= 0) {
+      return 0.0F;
+    }
+    const float center_y = static_cast<float>(rect.y) + (static_cast<float>(rect.height) * 0.5F);
+    return (0.5F - (center_y / static_cast<float>(frame.rows))) * camera_vertical_fov_deg_;
+  }
+
+  float gazeScore(const FaceObservation & face) const
+  {
+    if (!face.orientation.valid) {
+      return face.face_score > 0.0F ? 0.35F : 0.0F;
+    }
+    const float yaw_score = 1.0F - (std::abs(face.orientation.yaw_deg) / 60.0F);
+    const float pitch_score = 1.0F - (std::abs(face.orientation.pitch_deg) / 45.0F);
+    return std::clamp((0.75F * yaw_score) + (0.25F * pitch_score), 0.0F, 1.0F);
+  }
+
+  float bodyFacingScore(const FaceObservation & face) const
+  {
+    if (!face.orientation.valid) {
+      return face.face_score > 0.0F ? 0.35F : 0.25F;
+    }
+    return std::clamp(1.0F - (std::abs(face.orientation.yaw_deg) / 90.0F), 0.0F, 1.0F);
+  }
+
+  std::string proxemicSpace(float area_ratio) const
+  {
+    if (area_ratio >= 0.42F) {
+      return "intimate";
+    }
+    if (area_ratio >= 0.20F) {
+      return "personal";
+    }
+    if (area_ratio >= 0.06F) {
+      return "social";
+    }
+    if (area_ratio > 0.0F) {
+      return "public";
+    }
+    return "unknown";
+  }
+
+  std::string engagementStatus(float gaze_score, float facing_score, const std::string & gesture) const
+  {
+    if (
+      gaze_score >= 0.65F ||
+      gesture == "wave" ||
+      gesture == "invite" ||
+      gesture == "call")
+    {
+      return "engaged";
+    }
+    if (gaze_score >= 0.38F || facing_score >= 0.55F) {
+      return "engaging";
+    }
+    return "unengaged";
+  }
+
+  void fillEmotionForPerson(
+    const FaceObservation & face, std::size_t index, const msg::VisionSignals & state,
+    msg::PersonObservation & person) const
+  {
+    if (index == 0 && state.emotion_valid) {
+      person.emotion_valence = std::clamp(state.v_user_raw, -1.0F, 1.0F);
+      person.emotion_arousal = std::clamp(state.emotion_arousal, -1.0F, 1.0F);
+      person.emotion_valid = true;
+      person.emotion_label = state.emotion_label;
+      return;
+    }
+    person.emotion_valence = std::clamp(face.emotion_raw_score, -1.0F, 1.0F);
+    person.emotion_arousal = 0.0F;
+    person.emotion_valid = face.emotion_valid;
+    person.emotion_label = face.emotion_label;
+  }
+
+  std::pair<std::string, float> gestureForPerson(
+    const FaceObservation & face, const msg::VisionSignals & state) const
+  {
+    std::pair<std::string, float> best{"none", 0.0F};
+    for (const auto & gesture : state.gestures) {
+      if (
+        gesture.user_id != face.user_id &&
+        gesture.user_id != "unknown" &&
+        face.user_id != "unknown" &&
+        face.user_id != "stranger")
+      {
+        continue;
+      }
+      const std::string normalized = normalizeGesture(gesture.gesture);
+      if (gesture.score >= best.second) {
+        best = {normalized, std::clamp(gesture.score, 0.0F, 1.0F)};
+      }
+    }
+    return best;
+  }
+
+  std::string normalizeGesture(const std::string & raw) const
+  {
+    const std::string gesture = lowerCopy(raw);
+    if (gesture.find("wave") != std::string::npos) {
+      return "wave";
+    }
+    if (gesture.find("invite") != std::string::npos || gesture.find("call") != std::string::npos) {
+      return "invite";
+    }
+    if (gesture.find("reject") != std::string::npos || gesture.find("stop") != std::string::npos) {
+      return "reject";
+    }
+    if (gesture.find("detected") != std::string::npos) {
+      return "detected";
+    }
+    return raw.empty() ? "none" : raw;
   }
 
   void fillObjectSignals(
@@ -748,6 +1155,13 @@ private:
     gesture_events_pub_->publish(gestures);
   }
 
+  void publishPeople(const msg::PeopleSignals & people)
+  {
+    if (people_pub_ != nullptr) {
+      people_pub_->publish(people);
+    }
+  }
+
   void publishAnnotatedImage(
     const cv::Mat & frame, const std::vector<Detection> & detections,
     const std::vector<Detection> & gesture_detections,
@@ -822,14 +1236,22 @@ private:
   int camera_width_{1280};
   int camera_height_{720};
   double camera_fps_{15.0};
+  float camera_horizontal_fov_deg_{70.0F};
+  float camera_vertical_fov_deg_{43.0F};
   int camera_probe_count_{8};
   std::string image_topic_;
+  std::string depth_topic_;
+  std::string imu_topic_;
+  float depth_scale_{0.001F};
+  int depth_max_age_ms_{150};
+  std::string depth_source_{"ros_depth_topic"};
   std::string video_path_;
 
   std::string yolo_model_path_;
   std::string face_detector_model_path_;
   std::string face_recognizer_model_path_;
   std::string emotion_model_path_;
+  bool use_builtin_emotion_{false};
   std::string gesture_model_path_;
   std::string identity_store_path_;
 
@@ -871,6 +1293,7 @@ private:
   std::string face_orientation_topic_;
   std::string gesture_events_topic_;
   std::string annotated_image_topic_;
+  std::string people_topic_;
 
   ObjectDetector object_detector_;
   ObjectDetector gesture_detector_;
@@ -880,6 +1303,7 @@ private:
   std::vector<FaceObservation> last_faces_;
   std::vector<int> available_camera_indices_;
   std::mutex input_mutex_;
+  std::mutex depth_mutex_;
   std::mutex fusion_mutex_;
   msg::EmotionState last_advanced_emotion_;
   bool has_advanced_emotion_{false};
@@ -889,9 +1313,12 @@ private:
   rclcpp::Time last_advanced_gestures_received_;
 
   cv::VideoCapture capture_;
+  cv::Mat latest_depth_m_;
+  rclcpp::Time latest_depth_stamp_{0, 0, RCL_ROS_TIME};
   rclcpp::TimerBase::SharedPtr capture_timer_;
   rclcpp::TimerBase::SharedPtr camera_list_timer_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
   rclcpp::Subscription<msg::EmotionState>::SharedPtr advanced_emotion_sub_;
   rclcpp::Subscription<msg::GestureEvents>::SharedPtr advanced_gestures_sub_;
   rclcpp::Publisher<msg::VisionSignals>::SharedPtr signals_pub_;
@@ -901,6 +1328,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr novelty_pub_;
   rclcpp::Publisher<msg::FaceOrientation>::SharedPtr face_orientation_pub_;
   rclcpp::Publisher<msg::GestureEvents>::SharedPtr gesture_events_pub_;
+  rclcpp::Publisher<msg::PeopleSignals>::SharedPtr people_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr annotated_image_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr enroll_service_;
   rclcpp::Service<srv::SetInputSource>::SharedPtr set_input_service_;

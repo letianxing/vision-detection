@@ -239,7 +239,7 @@ class HandGestureRecognizer:
         return [item for item in self.history if now - item["t"] <= seconds]
 
     def _classify(self):
-        samples = self._recent(2.0)
+        samples = self._recent(1.8)
         if len(samples) < 5:
             return None, 0.0
 
@@ -255,6 +255,7 @@ class HandGestureRecognizer:
         open_range = float(opens.max() - opens.min())
         z_range = float(tip_z.max() - tip_z.min())
         area_range = float(areas.max() - areas.min())
+        open_count_range = float(open_counts.max() - open_counts.min())
         area_start = float(np.median(areas[: max(2, len(areas) // 4)]))
         area_end = float(np.median(areas[-max(2, len(areas) // 4):]))
         area_growth = area_end / max(area_start, 1e-4)
@@ -264,34 +265,47 @@ class HandGestureRecognizer:
         )
         median_open = float(np.median(opens))
         median_open_count = float(np.median(open_counts))
+        median_area = float(np.median(areas))
 
         wave_turns = self._turn_count(xs, min_delta=0.010)
         curl_turns = self._turn_count(opens, min_delta=0.025)
         z_turns = self._turn_count(tip_z, min_delta=0.018)
+        area_turns = self._turn_count(areas, min_delta=0.010)
 
-        if x_range > 0.045 and wave_turns >= 1 and y_range < 0.32 and median_open_count >= 3:
+        if x_range > 0.040 and wave_turns >= 1 and y_range < 0.35 and median_open_count >= 3:
             return "hi", clamp((x_range / 0.14) + (0.10 * wave_turns), 0.35, 1.0)
 
+        invite_motion = (
+            open_range > 0.08 or
+            open_count_range >= 1.0 or
+            z_range > 0.020 or
+            area_range > 0.025
+        )
         if (
-            area_growth > 1.10
-            and recent_area_std < 0.012
-            and recent_xy_motion < 0.035
-            and median_open_count >= 3
-            and median_open > 1.12
-        ):
-            return "reject", clamp((area_growth - 1.0) / 0.35, 0.35, 1.0)
-
-        if (
-            (open_range > 0.10 or z_range > 0.025 or area_range > 0.035)
-            and (curl_turns >= 1 or z_turns >= 1 or open_range > 0.16)
-            and x_range < 0.24
-            and y_range < 0.32
+            invite_motion
+            and (curl_turns >= 1 or z_turns >= 1 or area_turns >= 1 or open_range > 0.12)
+            and x_range < 0.26
+            and y_range < 0.35
         ):
             return "invite", clamp(
-                (open_range / 0.28) + (z_range / 0.08) + (0.08 * curl_turns),
+                (open_range / 0.24) +
+                (open_count_range * 0.18) +
+                (z_range / 0.07) +
+                (area_range / 0.10),
                 0.35,
                 1.0,
             )
+
+        if (
+            median_open_count >= 3
+            and median_open > 1.10
+            and recent_xy_motion < 0.040
+            and open_range < 0.12
+            and x_range < 0.12
+            and y_range < 0.18
+            and (area_growth > 1.08 or median_area > 0.030)
+        ):
+            return "reject", clamp(((area_growth - 1.0) / 0.25) + (median_area / 0.10), 0.35, 1.0)
 
         return None, 0.0
 
@@ -316,6 +330,7 @@ class AdvancedPerceptionNode(Node):
         self.declare_parameter("hand_model_path", "")
         self.declare_parameter("emotion_backend", "pyfeat")
         self.declare_parameter("emotion_interval_sec", 0.7)
+        self.declare_parameter("gesture_interval_sec", 0.12)
 
         self.bridge = CvBridge()
         self.emotion_pub = self.create_publisher(
@@ -340,6 +355,10 @@ class AdvancedPerceptionNode(Node):
             )
             self.emotion_backend.load()
         self.hand_gestures = HandGestureRecognizer(self.get_logger(), hand_model_path)
+        self.gesture_interval_sec = max(
+            0.02, float(self.get_parameter("gesture_interval_sec").value)
+        )
+        self.last_gesture_at = 0.0
 
         image_topic = str(self.get_parameter("image_topic").value)
         self.create_subscription(Image, image_topic, self._on_image, 10)
@@ -356,6 +375,11 @@ class AdvancedPerceptionNode(Node):
             result = self.emotion_backend.analyze(frame)
             if result is not None:
                 self._publish_emotion(msg, result)
+
+        now = time.time()
+        if now - self.last_gesture_at < self.gesture_interval_sec:
+            return
+        self.last_gesture_at = now
 
         events = self.hand_gestures.detect(frame)
         gesture_msg = GestureEvents()

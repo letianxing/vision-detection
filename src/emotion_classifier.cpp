@@ -83,7 +83,7 @@ EmotionClassifier::Result EmotionClassifier::classify(const cv::Mat & bgr_face)
       denom += value;
     }
     if (denom <= 0.0F) {
-      return 0.0F;
+      return {};
     }
     for (float & value : logits) {
       value /= denom;

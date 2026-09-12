@@ -1,0 +1,38 @@
+{
+  "mac_builtin": {
+    "source_type": "opencv",
+    "camera_index": 0,
+    "horizontal_fov_deg": 70.0,
+    "vertical_fov_deg": 43.0,
+    "depth_source": "monocular_size_proxy"
+  },
+  "realsense_d435i": {
+    "source_type": "ros_topic",
+    "image_topic": "/camera/camera/color/image_raw",
+    "depth_topic": "/camera/camera/aligned_depth_to_color/image_raw",
+    "imu_topic": "/camera/camera/imu",
+    "horizontal_fov_deg": 69.4,
+    "vertical_fov_deg": 42.5,
+    "depth_scale": 0.001,
+    "depth_source": "realsense_d435i"
+  },
+  "realsense_d405": {
+    "source_type": "realsense",
+    "horizontal_fov_deg": 87.0,
+    "vertical_fov_deg": 58.0,
+    "depth_source": "realsense_d405",
+    "ideal_range_m": [0.07, 0.50],
+    "notes": "D405 is a short-range camera; use it for close interaction/proxemics, not 3-8m tests."
+  },
+  "indemind_m1": {
+    "source_type": "ros_topic",
+    "image_topic": "/indemind/left/image_raw",
+    "depth_topic": "/indemind/depth/image_raw",
+    "imu_topic": "/indemind/imu",
+    "horizontal_fov_deg": 120.0,
+    "vertical_fov_deg": 75.0,
+    "depth_scale": 0.001,
+    "depth_source": "indemind_m1",
+    "notes": "Topic names must be remapped to the installed INDEMIND ROS SDK version. The M1 image stream is monochrome stereo."
+  }
+}

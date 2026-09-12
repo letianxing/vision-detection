@@ -13,6 +13,7 @@ The node publishes compact perception signals that downstream ROS2 nodes can con
 - `novelty`: whether selected object categories such as `cat`, `dog`, or `bottle` are visible
 - `face_orient`: estimated yaw/pitch/roll for the nearest face
 - `gestures`: hand gesture events from the advanced MediaPipe node when enabled, otherwise an optional gesture ONNX model or identity events such as `owner_detected`
+- `/vision/people`: per-person observations for attention and ROS4HRI bridging, including `person_id`, transient `face_id/body_id`, estimated azimuth/elevation, gaze, body-facing, proxemics, engagement, emotion, and gesture fields
 
 ## Models
 
@@ -73,10 +74,14 @@ OPENCV_AVFOUNDATION_SKIP_AUTH=1 .venv312/bin/python scripts/local_vision_dashboa
   --jpeg-quality 76 \
   --pyfeat-interval 1.2 \
   --camera-width 960 \
-  --camera-height 540
+  --camera-height 540 \
+  --yolo-size 640 \
+  --object-interval 0.5
 ```
 
 In ROS2 launch mode, `advanced_perception:=true` starts `scripts/advanced_perception_node.py`. It subscribes to `/vision/annotated_image`, publishes py-feat valence/arousal to `/vision/advanced_emotion`, publishes MediaPipe hand events to `/vision/gesture_events_advanced`, and the C++ node fuses those into `/vision/signals`.
+
+By default, py-feat mode does not silently downgrade to FER+. If py-feat cannot load, emotion is marked invalid. This avoids hidden accuracy changes. To explicitly use the lighter built-in FER+ path, run the local dashboard with `--emotion-backend ferplus`, or launch ROS2 with `advanced_perception:=false use_builtin_emotion:=true`.
 
 ## Build
 
@@ -111,10 +116,48 @@ http://localhost:8080
 ros2 launch vision_detection vision_detection.launch.py source_type:=ros_topic image_topic:=/camera/image_raw
 ```
 
+### RealSense D435i
+
+先由 `realsense-ros` 发布对齐 RGB-D，再启动视觉节点：
+
+```bash
+ros2 launch vision_detection vision_detection.launch.py \
+  source_type:=ros_topic \
+  image_topic:=/camera/camera/color/image_raw \
+  depth_topic:=/camera/camera/aligned_depth_to_color/image_raw \
+  depth_source:=realsense_d435i
+```
+
+### RealSense D405
+
+D405 是近距离深度相机，官方理想范围约 7cm-50cm，适合近距离 Person/proxemic 测试，不适合替代 D435i 做 3-8m 远距离测试。[D405 官方规格](https://www.realsenseai.com/products/stereo-depth-camera-d405/)
+
+```bash
+python3 -m pip install pyrealsense2
+python3 scripts/local_vision_dashboard.py --source-type realsense --source-id "" \
+  --host 127.0.0.1 --port 8080
+```
+
+### INDEMIND M1
+
+M1 官方 SDK 支持 Linux/ROS，不作为 Mac 原生首测设备。Jetson/Linux 上启动厂商 ROS SDK 后：
+
+```bash
+ros2 launch vision_detection vision_detection.launch.py \
+  source_type:=ros_topic \
+  image_topic:=/indemind/left/image_raw \
+  depth_topic:=/indemind/depth/image_raw \
+  depth_source:=indemind_m1 \
+  camera_horizontal_fov_deg:=120.0 \
+  camera_vertical_fov_deg:=75.0
+```
+
+M1 SDK 版本间 topic 名可能不同，按实际 `ros2 topic list` remap。下游仍统一输出 `distance_m/distance_confidence/depth_source`，不改变 attention 接口。设备默认值记录在 `config/camera_profiles.json`。
+
 To disable the Python advanced model node and use only the C++ FER+/YOLO path:
 
 ```bash
-ros2 launch vision_detection vision_detection.launch.py advanced_perception:=false
+ros2 launch vision_detection vision_detection.launch.py advanced_perception:=false use_builtin_emotion:=true
 ```
 
 Disable the dashboard if you only need topics:
@@ -126,6 +169,7 @@ ros2 launch vision_detection vision_detection.launch.py dashboard:=false
 ## Published Topics
 
 - `/vision/signals` (`vision_detection/msg/VisionSignals`): aggregate signal message
+- `/vision/people` (`vision_detection/msg/PeopleSignals`): per-person observations for `robot-attention-perception`
 - `/vision/available_cameras` (`vision_detection/msg/CameraList`): local cameras detected when the service starts
 - `/vision/near_human_present` (`std_msgs/msg/Bool`)
 - `/vision/v_user_raw` (`std_msgs/msg/Float32`): nearest face emotion score in `[-1, 1]`
@@ -135,6 +179,12 @@ ros2 launch vision_detection vision_detection.launch.py dashboard:=false
 - `/vision/annotated_image` (`sensor_msgs/msg/Image`, optional debug image)
 - `/vision/advanced_emotion` (`vision_detection/msg/EmotionState`, consumed by the C++ node when `use_advanced_emotion` is true)
 - `/vision/gesture_events_advanced` (`vision_detection/msg/GestureEvents`, consumed by the C++ node when `use_advanced_gestures` is true)
+
+ROS4HRI bridge mapping:
+
+- `/vision/people` should map to `/humans/faces/tracked`, `/humans/bodies/tracked`, `/humans/persons/tracked`, `/humans/candidate_matches`, and TF frames such as `face_<faceID>`, `gaze_<faceID>`, and `body_<bodyID>`.
+- `face_id` and `body_id` are transient observation IDs. `person_id` is the longer-lived identity when recognition is available, otherwise a local session ID such as `vision_person_0`.
+- `voice_id` is left empty by this visual node and should be filled by a ROS4HRI person manager or attention/person association layer after matching visual bearing with acoustic tracks.
 
 Services:
 
@@ -174,6 +224,8 @@ The optimized local dashboard separates camera streaming from model inference:
 - inference thread: runs object, face, hand, and emotion models at a lower rate
 - default local output is resized to `960x540` before encoding and inference
 - py-feat valence/arousal is throttled by `--pyfeat-interval`
+- YOLO still uses the same model and default `640` input size, but runs at a lower cadence through `--object-interval`
+- py-feat mode does not load the FER+ ONNX model, so the two emotion models are not resident at the same time
 
 Measured on the current MacBook Pro with `--emotion-backend pyfeat`:
 
