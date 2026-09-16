@@ -32,3 +32,19 @@ Attention现在有视听/记忆/可选内部状态支持源；本项目既有感
 ## 会话切换交接（2026-09-16，最新）
 新AI先读 `/Users/letianxing/Golands/voice-detection/SESSION_HANDOFF.md`，再读本项目当前摘要。
 本轮已核查：本机全部感知/Brain服务停止，162远端Qwen健康运行。最新Attention101/Brain60/DOM测试通过，不等于现场准确率。没有提交git，保护所有未提交修改和用户数据。
+
+## 未识别的人也要保持同一个人：短期人脸重识别（2026-09-16，最新）
+现场日志里两分钟内出现 anonymous_0001…0013 和反复的 unstable_face_body_voice_association，
+但同一时间房间里只有一个访客。根因在这里：人脸跟踪是按框重叠做的（IoU<0.28 或断开 2 秒就换 track），
+而 stable_person_id 在没认出用户时直接用 vision_<face_track_id>，所以人一转头、检测漏两帧，
+下游就收到一个全新的人，注意力再建一个新的陌生人，这个人身上什么都攒不起来。
+新增 GuestGallery：认不出是谁时，用已有的人脸模板（质量门槛 + 多帧均值那套，不是单帧）在会话内做重识别，
+同一张脸拿回同一个 guest id，person_id 变成 vision_guest_0001，跟踪断了也不变。
+- 阈值 0.45（VISION_GUEST_THRESHOLD），比登记匹配的 0.38 严：把两个陌生人合并成一个会把甲说的话算到乙头上，
+  而把一个人拆成两个只是丢连续性，前者更糟。这个数字没有在真人脸上标定过。
+- 10 分钟没再出现就忘掉（VISION_GUEST_TTL_S），最多 32 个人，不落盘、不是登记，人走了就没了。
+- 匹配上之后模板按 0.9/0.1 缓慢更新，跟着光线和角度走，但一帧拉不动身份。
+- 完全没拿到人脸嵌入（质量不过关）时仍然退回 vision_<face_track_id>，不假装认识。
+新增用例：跟踪断了再回来还是同一个 guest、不同的脸是不同的 guest、过了 TTL 就是新人、
+person_id 的优先级是 名字 > guest > 框跟踪。
+验证：vision 31、attention 186、voice 84、brain 77 全过。

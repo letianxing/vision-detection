@@ -350,6 +350,60 @@ class HandGestureRecognizer:
         return turns
 
 
+class GuestGallery:
+    """Short-term identity for people nobody has enrolled.
+
+    Face box tracking loses a person the moment they turn away, walk behind
+    somebody, or the detector misses two frames — and every loss used to mint a
+    new identity downstream. Matching the face template instead keeps one person
+    one person for as long as they are around. Deliberately short-lived: this is
+    not enrolment, it holds nobody after they leave, and it is never written to
+    disk.
+    """
+
+    def __init__(self, threshold=None, ttl_s=None, slots=32):
+        # Stricter than the enrolment threshold on purpose: merging two strangers
+        # attributes one person's words to another, while splitting one stranger
+        # in two only loses continuity. Neither number is calibrated on real
+        # faces — VISION_GUEST_THRESHOLD is there because it will need tuning.
+        self.threshold = float(threshold if threshold is not None else os.environ.get("VISION_GUEST_THRESHOLD", "0.45"))
+        self.ttl_ms = float(ttl_s if ttl_s is not None else os.environ.get("VISION_GUEST_TTL_S", "600")) * 1000
+        self.slots = slots
+        self.entries = {}
+        self.next_id = 1
+
+    def resolve(self, template, stamp_ms):
+        vector = np.asarray(template, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm) or norm <= 0:
+            return None
+        self.entries = {key: entry for key, entry in self.entries.items()
+                        if stamp_ms - entry["seen_at"] <= self.ttl_ms}
+        best, best_score = None, 0.0
+        for key, entry in self.entries.items():
+            saved = entry["embedding"]
+            if saved.size != vector.size:
+                continue
+            score = float(np.dot(vector, saved) / (norm * float(np.linalg.norm(saved)) + 1e-6))
+            if score > best_score:
+                best, best_score = key, score
+        if best is None or best_score < self.threshold:
+            best = f"guest_{self.next_id:04d}"
+            self.next_id += 1
+            self.entries[best] = {"embedding": vector.copy(), "seen_at": stamp_ms, "frames": 1}
+            if len(self.entries) > self.slots:
+                oldest = min(self.entries, key=lambda key: self.entries[key]["seen_at"])
+                self.entries.pop(oldest, None)
+            return best
+        entry = self.entries[best]
+        # Drift with the person (lighting, angle) without letting one frame move
+        # the identity far.
+        entry["embedding"] = entry["embedding"] * 0.9 + vector * 0.1
+        entry["seen_at"] = stamp_ms
+        entry["frames"] += 1
+        return best
+
+
 class LocalVisionRuntime:
     def __init__(
         self,
@@ -419,6 +473,11 @@ class LocalVisionRuntime:
         self.face_recognizer = self.face_embedder
         self.identity_cache = []
         self.face_templates = face_embedder.TemplateTracker()
+        # Somebody nobody has enrolled is still the same somebody. Without this
+        # they were re-invented every time the face box lost its track: the field
+        # session minted anonymous_0001 through anonymous_0013 for what was one
+        # person in the room, so nothing about them ever accumulated.
+        self.guest_gallery = GuestGallery()
         self.identity_interval_ms = int(os.environ.get("VISION_IDENTITY_INTERVAL_MS", "300"))
         print(f"face backend: {self.face_backend.get('label', self.face_backend['backend'])} "
               f"({self.face_backend.get('reason')})", flush=True)
@@ -634,6 +693,7 @@ class LocalVisionRuntime:
                     "box": box,
                     "score": float(row[14]),
                     "user_id": identity["user_id"],
+                    "guest_id": identity.get("guest_id"),
                     "user_role": identity["user_role"],
                     "identity_similarity": identity["similarity"],
                     "identity_quality": identity.get("identity_quality"),
@@ -732,7 +792,11 @@ class LocalVisionRuntime:
         common = {"identity_quality": quality, "template_frames": depth,
                   "_embedding": embedding if quality["usable"] else None}
         if best[2] < threshold:
-            return dict(common, user_id="stranger", user_role="stranger", similarity=best[2])
+            # Not anybody we know, but keep it the same not-anybody: the guest id
+            # follows the face, not the box, so losing the track for a second no
+            # longer produces a new person.
+            guest = self.guest_gallery.resolve(vector, stamp_ms or int(time.time() * 1000))
+            return dict(common, user_id="stranger", user_role="stranger", similarity=best[2], guest_id=guest)
         return dict(common, user_id=best[0], user_role=best[1], similarity=best[2])
 
     def enroll_nearest_face(self, user_id, user_role="known", require_single=False, dry_run=False, started_ms=0, ended_ms=0):
@@ -924,15 +988,45 @@ class LocalVisionRuntime:
             except OSError:
                 pass
 
+    # Where the nose sits between eyes and mouth on a face looking straight
+    # ahead. An engineering prior, not a measured population value.
+    NEUTRAL_NOSE_DROP = 0.52
+
     def estimate_orientation(self, box, landmarks):
-        x, y, w, h = box
+        """Head pose from the landmarks alone, never from the detection box.
+
+        Yaw used to be the nose's offset from the centre of the bounding box.
+        That box is not centred on the nose even head-on, and it jitters, so a
+        person looking straight at the camera measured around 45 degrees of yaw
+        — which put gaze at 0.42 against a 0.65 threshold and quietly disabled
+        every path that needs somebody to be looking at the robot. Measuring
+        against the eye midline in inter-ocular units removes the box entirely.
+        """
         right_eye, left_eye, nose, right_mouth, left_mouth = landmarks
-        roll = math.degrees(math.atan2(left_eye[1] - right_eye[1], left_eye[0] - right_eye[0]))
-        box_cx = x + w * 0.5
-        yaw = clamp(((nose[0] - box_cx) / (w * 0.5)) * 45.0, -60.0, 60.0)
-        eye_cy = (left_eye[1] + right_eye[1]) * 0.5
-        mouth_cy = (left_mouth[1] + right_mouth[1]) * 0.5
-        pitch = clamp(((nose[1] - ((eye_cy + mouth_cy) * 0.5)) / (h * 0.25)) * 30.0, -45.0, 45.0)
+        eye_dx = left_eye[0] - right_eye[0]
+        eye_dy = left_eye[1] - right_eye[1]
+        roll = math.degrees(math.atan2(eye_dy, eye_dx))
+        inter_ocular = math.hypot(eye_dx, eye_dy)
+        eye_mid = ((left_eye[0] + right_eye[0]) * 0.5, (left_eye[1] + right_eye[1]) * 0.5)
+        mouth_mid = ((left_mouth[0] + right_mouth[0]) * 0.5, (left_mouth[1] + right_mouth[1]) * 0.5)
+
+        # Work in the eye-line frame so a tilted head does not leak into yaw.
+        angle = math.radians(-roll)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+
+        def rotated(point):
+            dx, dy = point[0] - eye_mid[0], point[1] - eye_mid[1]
+            return dx * cos_a - dy * sin_a, dx * sin_a + dy * cos_a
+
+        nose_x, nose_y = rotated(nose)
+        face_height = rotated(mouth_mid)[1]
+        if inter_ocular < 8.0 or face_height <= 4.0:
+            return {"valid": False, "yaw_deg": 0.0, "pitch_deg": 0.0, "roll_deg": roll,
+                    "reason": "landmarks_too_small_to_measure_pose"}
+
+        yaw = clamp(nose_x / (inter_ocular * 0.5) * 45.0, -60.0, 60.0)
+        neutral = face_height * self.NEUTRAL_NOSE_DROP
+        pitch = clamp((nose_y - neutral) / (face_height * 0.5) * 30.0, -45.0, 45.0)
         return {"valid": True, "yaw_deg": yaw, "pitch_deg": pitch, "roll_deg": roll}
 
     def compute_state(self, frame, detections, faces, hand_events, depth=None, depth_source="none"):
@@ -1071,7 +1165,7 @@ class LocalVisionRuntime:
                 emotion_confidence = face["emotion_confidence"]
                 emotion_arousal = face["emotion_arousal"]
                 emotion_valid = face.get("emotion_model_valid", True) and self.emotion_quality_ok(frame, face)
-            person_id = self.stable_person_id(face["user_id"], face["track_id"])
+            person_id = self.stable_person_id(face["user_id"], face["track_id"], face.get("guest_id"))
             people.append(
                 {
                     "person_id": person_id,
@@ -1180,10 +1274,12 @@ class LocalVisionRuntime:
         return best_index
 
     @staticmethod
-    def stable_person_id(user_id, face_track_id):
+    def stable_person_id(user_id, face_track_id, guest_id=None):
         if user_id and user_id not in {"unknown", "stranger"}:
             return "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in user_id)
-        return f"vision_{face_track_id}"
+        # A recognised-as-unknown face keeps its guest id across track breaks;
+        # only a face we could not even embed falls back to the box track.
+        return f"vision_{guest_id or face_track_id}"
 
     @staticmethod
     def area_ratio(frame, box):
