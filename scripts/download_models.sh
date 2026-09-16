@@ -36,4 +36,8 @@ download \
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" \
   "${MODEL_DIR}/hand_landmarker.task"
 
+download \
+  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" \
+  "${MODEL_DIR}/face_landmarker.task"
+
 echo "models are ready in ${MODEL_DIR}"

@@ -16,6 +16,9 @@ import numpy as np
 from aiohttp import WSMsgType, web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
+from lip_landmarks import LipLandmarker
+from flash_events import FlashDetector
+
 from capture_sources import create_capture_source, list_realsense_sources
 
 try:
@@ -400,7 +403,6 @@ class LocalVisionRuntime:
         self.object_interval = max(float(object_interval), 0.05)
         self.last_object_at = 0.0
         self.cached_detections = []
-        self.previous_mouth_rois = {}
         self.face_tracks = {}
         self.next_face_track_id = 1
         self.identity_store_path = self.root / "config" / "identities.local.json"
@@ -418,6 +420,10 @@ class LocalVisionRuntime:
             else None
         )
         self.hand_gestures = HandGestureRecognizer(model_dir / "hand_landmarker.task")
+        self.flash_detector=FlashDetector()
+        self.flash_events=deque(maxlen=30)
+        self.registration_faces = deque(maxlen=100)
+        self.lip_landmarker = LipLandmarker(model_dir / "face_landmarker.task")
         if self.emotion_backend == "ferplus":
             self.emotion_net = cv2.dnn.readNetFromONNX(str(model_dir / "emotion-ferplus-12-int8.onnx"))
         self.load_pyfeat()
@@ -571,22 +577,38 @@ class LocalVisionRuntime:
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, self.inference_interval - elapsed))
 
+    def timed(self, name, function, *args):
+        started = time.perf_counter()
+        result = function(*args)
+        if not hasattr(self, "model_timings"):
+            self.model_timings = {}
+        self.model_timings[name] = {"ms": round((time.perf_counter()-started)*1000, 2), "stamp_ms": int(time.time()*1000)}
+        return result
+
     def process_frame(self, frame, depth=None, depth_source="none"):
+        frame_started = time.perf_counter()
         now = time.time()
         if now - self.last_object_at >= self.object_interval:
-            detections = self.object_detector.detect(frame)
+            detections = self.timed("YOLOv8n", self.object_detector.detect, frame)
             self.cached_detections = detections
             self.last_object_at = now
         else:
             detections = list(self.cached_detections)
         faces = self.detect_faces(frame)
-        hand_result = self.hand_gestures.detect(frame)
+        hand_result = self.timed("MediaPipe Hand", self.hand_gestures.detect, frame)
         state = self.compute_state(frame, detections, faces, hand_result["events"], depth, depth_source)
+        self.flash_events.extend(self.flash_detector.update(frame,int(now*1000)))
+        state["flash_events"]=list(self.flash_events)
+        state["model_timings"] = dict(getattr(self, "model_timings", {}))
+        state["frame_processing_ms"] = round((time.perf_counter()-frame_started)*1000, 2)
+        previous = getattr(self, "_last_measured_frame", now)
+        state["inference_fps"] = round(1 / max(.001, now-previous), 1) if previous != now else None
+        self._last_measured_frame = now
         return state, detections, faces, hand_result
 
     def detect_faces(self, frame):
         self.face_detector.setInputSize((frame.shape[1], frame.shape[0]))
-        _, faces = self.face_detector.detect(frame)
+        _, faces = self.timed("YuNet", self.face_detector.detect, frame)
         if faces is None:
             return []
         results = []
@@ -595,8 +617,8 @@ class LocalVisionRuntime:
             box = [max(0, x), max(0, y), max(1, min(frame.shape[1] - x, w)), max(1, min(frame.shape[0] - y, h))]
             landmarks = [(float(row[i]), float(row[i + 1])) for i in range(4, 14, 2)]
             orient = self.estimate_orientation(box, landmarks)
-            emotion = self.emotion_result(frame, box)
-            identity = self.identify_face(frame, row)
+            emotion = self.timed("Emotion", self.emotion_result, frame, box)
+            identity = self.timed("SFace", self.identify_face, frame, row)
             results.append(
                 {
                     "box": box,
@@ -604,6 +626,7 @@ class LocalVisionRuntime:
                     "user_id": identity["user_id"],
                     "user_role": identity["user_role"],
                     "identity_similarity": identity["similarity"],
+                    "_embedding": identity.get("_embedding"),
                     "emotion_raw": emotion["score"],
                     "emotion_label": emotion["label"],
                     "emotion_confidence": emotion["confidence"],
@@ -617,9 +640,11 @@ class LocalVisionRuntime:
             )
         results.sort(key=lambda face: face["box"][2] * face["box"][3], reverse=True)
         self.assign_face_tracks(results)
-        for face in results:
-            mouth = self.mouth_features(frame, face["box"], face["_landmarks"], face["track_id"])
-            face.update(mouth)
+        self.timed("MediaPipe Face", self.lip_landmarker.detect, frame, results)
+        if len(results)==1 and results[0].get("_embedding") and results[0]["score"]>=.9:
+            face=results[0]
+            with self.lock:
+                self.registration_faces.append((int(time.time()*1000),face["track_id"],face["_embedding"],bool(face.get("lip_motion_valid") and face.get("lip_motion"))))
         return results
 
     def load_identities(self):
@@ -663,10 +688,10 @@ class LocalVisionRuntime:
                 best = (user_id, str(entry.get("role") or "known"), similarity)
         threshold = 0.38
         if best[2] < threshold:
-            return {"user_id": "stranger", "user_role": "stranger", "similarity": best[2]}
-        return {"user_id": best[0], "user_role": best[1], "similarity": best[2]}
+            return {"user_id": "stranger", "user_role": "stranger", "similarity": best[2], "_embedding": embedding}
+        return {"user_id": best[0], "user_role": best[1], "similarity": best[2], "_embedding": embedding}
 
-    def enroll_nearest_face(self, user_id, user_role="known"):
+    def enroll_nearest_face(self, user_id, user_role="known", require_single=False, dry_run=False, started_ms=0, ended_ms=0):
         user_id = str(user_id or "").strip()
         if not user_id:
             return {"success": False, "message": "user_id is required"}
@@ -675,8 +700,23 @@ class LocalVisionRuntime:
             faces = list(self.latest_faces)
         if frame is None or not faces:
             return {"success": False, "message": "no face is available"}
+        if require_single and len(faces) != 1:
+            return {"success": False, "message": "请只保留注册者一张人脸在镜头内"}
         face = faces[0]
-        embedding = self.face_embedding(frame, face.get("_row", []))
+        embedding = None
+        if require_single:
+            with self.lock:
+                matched=[(e,moving) for t,k,e,moving in self.registration_faces if k==face.get("track_id") and max(started_ms,int(time.time()*1000)-5000)<=t<=ended_ms+250]
+                samples=[e for e,moving in matched]
+            if len(samples)<5 or sum(bool(moving) for e,moving in matched)<2:
+                return {"success":False,"message":"请保持面对镜头，完整说一遍注册话术"}
+            vectors=np.asarray(samples,dtype=np.float32)
+            center=vectors.mean(axis=0);center/=max(float(np.linalg.norm(center)),1e-6)
+            if float(np.min(vectors@center))<.7:
+                return {"success":False,"message":"连续人脸样本不一致，请一人面对镜头重试"}
+            embedding=center.tolist()
+        else:
+            embedding = self.face_embedding(frame, face.get("_row", []))
         if embedding is None:
             # Re-run detection to retain the original YuNet 15-value row.
             self.face_detector.setInputSize((frame.shape[1], frame.shape[0]))
@@ -685,8 +725,9 @@ class LocalVisionRuntime:
                 embedding = self.face_embedding(frame, detected[0])
         if embedding is None:
             return {"success": False, "message": "face recognizer is unavailable"}
-        self.identities[user_id] = {"role": str(user_role or "known"), "embedding": embedding}
-        self.save_identities()
+        if not dry_run:
+            self.identities[user_id] = {"role": str(user_role or "known"), "embedding": embedding}
+            self.save_identities()
         return {
             "success": True,
             "message": f"enrolled {user_id}",
@@ -741,36 +782,6 @@ class LocalVisionRuntime:
         proximity = math.exp(-float(np.linalg.norm(left_center - right_center)) / scale)
         return float(0.65 * iou + 0.35 * proximity)
 
-    def mouth_features(self, frame, face_box, landmarks, face_track_id):
-        x, y, w, h = face_box
-        right_mouth, left_mouth = landmarks[3], landmarks[4]
-        mouth_cx = int(round((right_mouth[0] + left_mouth[0]) * 0.5))
-        mouth_cy = int(round((right_mouth[1] + left_mouth[1]) * 0.5))
-        mouth_w = max(8, int(round(abs(left_mouth[0] - right_mouth[0]) * 1.45)))
-        mouth_h = max(6, int(round(h * 0.20)))
-        x1 = max(x, mouth_cx - mouth_w // 2)
-        x2 = min(x + w, mouth_cx + mouth_w // 2)
-        y1 = max(y, mouth_cy - mouth_h // 2)
-        y2 = min(y + h, mouth_cy + mouth_h // 2)
-        roi = frame[y1:y2, x1:x2]
-        if roi.size == 0:
-            return {"mouth_open_ratio": 0.0, "lip_motion": False, "mouth_roi_features": []}
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        normalized = cv2.resize(gray, (8, 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-        darkness = 1.0 - float(np.mean(normalized))
-        contrast = float(np.std(normalized))
-        mouth_open_ratio = clamp((darkness * 0.45) + (contrast * 1.8), 0.0, 1.0)
-        key = str(face_track_id)
-        previous = self.previous_mouth_rois.get(key)
-        motion_score = 0.0 if previous is None else float(np.mean(np.abs(normalized - previous)))
-        self.previous_mouth_rois[key] = normalized
-        return {
-            "mouth_open_ratio": mouth_open_ratio,
-            "lip_motion": motion_score >= 0.022,
-            "mouth_motion_score": motion_score,
-            "mouth_roi_features": normalized.reshape(-1).tolist(),
-        }
-
     def emotion_result(self, frame, box):
         if self.pyfeat_ready:
             result = self.pyfeat_emotion_result(frame, box)
@@ -801,7 +812,7 @@ class LocalVisionRuntime:
         if face.size == 0:
             return {"score": 0.0, "label": "unknown", "confidence": 0.0, "valid": False}
         gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-        blob = cv2.dnn.blobFromImage(gray, 1.0 / 255.0, (64, 64), swapRB=False, crop=False)
+        blob = cv2.dnn.blobFromImage(gray, 1.0, (64, 64), swapRB=False, crop=False)
         self.emotion_net.setInput(blob)
         probs = softmax(self.emotion_net.forward())
         if probs.size < 8:
@@ -815,7 +826,7 @@ class LocalVisionRuntime:
             "confidence": float(probs[best_index]),
             "arousal": 0.0,
             "backend": "ferplus",
-            "valid": True,
+            "valid": bool(probs[best_index] >= .55 and np.sort(probs)[-1]-np.sort(probs)[-2] >= .15),
         }
 
     def pyfeat_emotion_result(self, frame, box):
@@ -944,6 +955,9 @@ class LocalVisionRuntime:
         people = self.compute_people(frame, persons, faces, gestures, emotion_score, emotion_raw, emotion_label, emotion_confidence, emotion_arousal, emotion_valid, depth, depth_source)
 
         return {
+            "objects": [{"label":d["label"],"confidence":d["score"],"bbox_area_ratio":self.area_ratio(frame,d["box"]),
+                         "center":[(d["box"][0]+d["box"][2]/2)/frame.shape[1],(d["box"][1]+d["box"][3]/2)/frame.shape[0]],
+                         "stamp_ms":int(self.last_object_at*1000)} for d in detections if d["label"]!="person"],
             "stamp": time.time(),
             "near_human_present": bool(faces or area_ratio >= 0.12),
             "nearest_user_id": nearest["user_id"] if nearest else "none",
@@ -1025,10 +1039,15 @@ class LocalVisionRuntime:
                     "distance_m": float(distance_m or 0.0),
                     "distance_confidence": distance_confidence,
                     "depth_source": resolved_depth_source,
+                    "reflex_area_ratio": self.area_ratio(frame, face["box"]),
                     "face_visible": True,
                     "face_confidence": clamp(face["score"], 0.0, 1.0),
                     "mouth_open_ratio": face.get("mouth_open_ratio", 0.0),
                     "lip_motion": face.get("lip_motion", False),
+                    "lip_motion_valid": face.get("lip_motion_valid", False),
+                    "lip_backend": face.get("lip_backend", "none"),
+                    "lip_reason": face.get("lip_reason", "unavailable"),
+                    "mouth_motion_score": face.get("mouth_motion_score", 0.0),
                     "mouth_roi_features": face.get("mouth_roi_features", []),
                     "gaze_score": gaze,
                     "body_facing_score": facing,
@@ -1073,6 +1092,9 @@ class LocalVisionRuntime:
                     "face_confidence": 0.0,
                     "mouth_open_ratio": 0.0,
                     "lip_motion": False,
+                    "lip_motion_valid": False,
+                    "lip_backend": "none",
+                    "lip_reason": "no_face",
                     "mouth_roi_features": [],
                     "gaze_score": 0.0,
                     "body_facing_score": 0.25,
@@ -1203,6 +1225,8 @@ class LocalVisionRuntime:
     def gesture_for_face(face, gestures):
         best = ("none", 0.0)
         for event in gestures:
+            if str(event.get("gesture", "")).endswith("_detected"):
+                continue
             if (
                 event["user_id"] != face["user_id"]
                 and event["user_id"] != "unknown"
@@ -1254,7 +1278,7 @@ class LocalVisionRuntime:
             cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
             cv2.putText(
                 out,
-                f'stranger {face["emotion_label"]} raw={face["emotion_raw"]:.2f}',
+                f'{face.get("user_role", "unknown")} id={str(face.get("user_id", "unknown")) if str(face.get("user_id", "unknown")).isascii() else "face-" + str(face.get("track_id", "unknown"))} {face["emotion_label"]} raw={face["emotion_raw"]:.2f}',
                 (x, min(out.shape[0] - 8, y + h + 18)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -1337,7 +1361,7 @@ def make_app(runtime, web_dir):
     @routes.post("/api/enroll")
     async def api_enroll(request):
         data = await request.json()
-        result = runtime.enroll_nearest_face(data.get("user_id"), data.get("user_role", "known"))
+        result = runtime.enroll_nearest_face(data.get("user_id"), data.get("user_role", "known"), bool(data.get("require_single")), bool(data.get("dry_run")), int(data.get("started_ms") or 0), int(data.get("ended_ms") or 0))
         return web.json_response(result, status=200 if result.get("success") else 400)
 
     @routes.get("/ws")
