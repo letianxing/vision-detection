@@ -27,7 +27,29 @@
 
 详细历史与最新追加记录请同时阅读本项目AGENTS.md，冲突以用户最新指令为准。
 
-## 可插拔注意力（第三版，2026-09-16 最新）
+## 可插拔注意力（第四版，2026-09-16 最新）
+输入源五个（8092 可勾选，存 .run/attention-config.json）：audio_visual、memory_context、linguistic_context、
+cross_session_memory、internal_state（默认关闭，无生产者）。关闭=消融该通道证据，不是关硬件或安全反射。
+算法为独立 .so（C ABI 见 include/robot_attention_perception/attention_plugin_abi.h，编译 bash scripts/build_attention_plugins.sh）：
+av_memory_language_v1（默认，自上而下相加）、av_memory_language_v2（Reynolds-Heeger 乘性注意场 + Selective Tuning
+方位抑制环，交流意愿层与 v1 共享 attention_common.hpp）、builtin_audio_visual_v1（内置仅视听基线）。
+v1/v2 跑同一套行为用例且全过；两者优劣未经现场对比，所以默认仍是 v1。缺 .so 不阻断启动，回退基线并报错。
+统一订阅点 global_workspace.py：每个感知周期广播一份内容（cycle/focus/target/engagement/coalition/sources/
+algorithm/provenance）。入口 GET /api/workspace、/api/workspace?since=N 回放、/api/workspace/stream (SSE)、
+ROS /attention/workspace。订阅者落后会丢帧并计数，不阻塞感知循环。Brain 现有 brain_input 通路未改。
+结构：自下而上（视听显著度、声学突变、句首唤醒词）+ 自上而下（工作记忆目标、熟悉度先验）的归一化竞争，
+其上再加一层按人的序贯证据累积决定「是不是在跟我交流」。内部状态将来接 arousal/motivation 与第二层通道。
+记忆通道整体乘以识别置信度；角色（主人/陌生人）不进交流意愿层，只留在第一层 importance 影响「看哪里」。
+模型已替换：声纹 CampPlus -> ERes2NetV2（192 维，3 秒语音 14.1->53.9ms，句末计算）；
+人脸新增可切换后端，默认仍是 sface（Apache-2.0），arcface(buffalo_l w600k_r50) 已下载但权重仅限非商业研究，
+需确认用途后用 --face-backend arcface 启用；身份识别加 300ms 节流。旧声纹/人脸档案已按指示清空，
+备份在 ~/Golands/.identity-backup-*。阈值未在真人数据上标定。
+Attention 151、Brain 62、Vision 16、C++ 4 个测试目标、页面 DOM 通过；
+scripts/verify_attention_algorithm.py 为不开硬件的端到端离线检查（九个场景，含三组消融/对照）。
+权重与阈值是工程先验，未做现场 ROC 标定；论文数字不能当本机准确率。
+完整研究依据/协议/限制见 /Applications/声音/可插拔仿生注意力与论文依据.txt。
+
+## 可插拔注意力（第三版历史，2026-09-16）
 注意力输入源与算法都已解耦，8092 面板「注意力输入源与算法」可勾选来源、切换算法，选择存 .run/attention-config.json。
 来源五个：audio_visual、memory_context（本会话工作记忆）、linguistic_context（当前语境文本）、
 cross_session_memory（跨会话熟悉度，后台查 hri-memory-service，快循环只读缓存）、internal_state（默认关闭，无生产者）。

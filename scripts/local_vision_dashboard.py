@@ -366,6 +366,7 @@ class LocalVisionRuntime:
         object_interval=0.5,
         source_type="opencv",
         source_id="",
+        face_backend=None,
     ):
         self.root = Path(root)
         self.lock = threading.Lock()
@@ -413,12 +414,15 @@ class LocalVisionRuntime:
         self.face_detector = cv2.FaceDetectorYN_create(
             str(model_dir / "face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.8, 0.3, 5000
         )
-        recognizer_path = model_dir / "face_recognition_sface_2021dec.onnx"
-        self.face_recognizer = (
-            cv2.FaceRecognizerSF_create(str(recognizer_path), "")
-            if recognizer_path.exists() and hasattr(cv2, "FaceRecognizerSF_create")
-            else None
-        )
+        import face_embedder
+        self.face_embedder, self.face_backend = face_embedder.create(model_dir, face_backend)
+        self.face_recognizer = self.face_embedder
+        self.identity_cache = []
+        self.identity_interval_ms = int(os.environ.get("VISION_IDENTITY_INTERVAL_MS", "300"))
+        print(f"face backend: {self.face_backend.get('label', self.face_backend['backend'])} "
+              f"({self.face_backend.get('reason')})", flush=True)
+        if self.face_backend.get("warning"):
+            print("face backend warning: " + self.face_backend["warning"], flush=True)
         self.hand_gestures = HandGestureRecognizer(model_dir / "hand_landmarker.task")
         self.flash_detector=FlashDetector()
         self.flash_events=deque(maxlen=30)
@@ -618,7 +622,11 @@ class LocalVisionRuntime:
             landmarks = [(float(row[i]), float(row[i + 1])) for i in range(4, 14, 2)]
             orient = self.estimate_orientation(box, landmarks)
             emotion = self.timed("Emotion", self.emotion_result, frame, box)
-            identity = self.timed("SFace", self.identify_face, frame, row)
+            stamp_ms = int(time.time() * 1000)
+            identity = self.cached_identity(row, stamp_ms)
+            if identity is None:
+                identity = self.timed(self.face_backend.get("backend", "face"), self.identify_face, frame, row)
+                self.remember_identity(row, stamp_ms, identity)
             results.append(
                 {
                     "box": box,
@@ -662,16 +670,34 @@ class LocalVisionRuntime:
         )
 
     def face_embedding(self, frame, face_row):
-        if self.face_recognizer is None:
+        if self.face_embedder is None:
             return None
         try:
-            aligned = self.face_recognizer.alignCrop(frame, np.asarray(face_row, dtype=np.float32))
-            feature = self.face_recognizer.feature(aligned)
-            vector = np.asarray(feature, dtype=np.float32).reshape(-1)
-            norm = float(np.linalg.norm(vector))
-            return (vector / norm).tolist() if norm > 1e-6 else None
+            vector = self.face_embedder.embed(frame, face_row)
+            return None if vector is None else vector.tolist()
         except Exception:
             return None
+
+    def cached_identity(self, face_row, stamp_ms):
+        """Identity does not change between frames, so it is not recomputed every
+        frame. The cache is keyed on where the face is, because face tracks are
+        only assigned after identification."""
+        row = np.asarray(face_row, dtype=np.float32).reshape(-1)
+        centre = (float(row[0] + row[2] / 2), float(row[1] + row[3] / 2))
+        span = max(float(row[2]), float(row[3]), 1.0)
+        self.identity_cache = [item for item in self.identity_cache
+                               if 0 <= stamp_ms - item["stamp_ms"] < self.identity_interval_ms]
+        for item in self.identity_cache:
+            if abs(item["centre"][0] - centre[0]) < span * 0.5 and abs(item["centre"][1] - centre[1]) < span * 0.5:
+                return item["identity"]
+        return None
+
+    def remember_identity(self, face_row, stamp_ms, identity):
+        row = np.asarray(face_row, dtype=np.float32).reshape(-1)
+        self.identity_cache.append({"centre": (float(row[0] + row[2] / 2), float(row[1] + row[3] / 2)),
+                                    "stamp_ms": stamp_ms, "identity": identity})
+        if len(self.identity_cache) > 16:
+            del self.identity_cache[:-16]
 
     def identify_face(self, frame, face_row):
         embedding = self.face_embedding(frame, face_row)
@@ -686,7 +712,7 @@ class LocalVisionRuntime:
             similarity = float(np.dot(vector, saved) / (np.linalg.norm(saved) + 1e-6))
             if similarity > best[2]:
                 best = (user_id, str(entry.get("role") or "known"), similarity)
-        threshold = 0.38
+        threshold = float(self.face_backend.get("threshold", 0.38))
         if best[2] < threshold:
             return {"user_id": "stranger", "user_role": "stranger", "similarity": best[2], "_embedding": embedding}
         return {"user_id": best[0], "user_role": best[1], "similarity": best[2], "_embedding": embedding}
@@ -734,7 +760,7 @@ class LocalVisionRuntime:
             "user_id": user_id,
             "user_role": str(user_role or "known"),
             "embedding": embedding,
-            "embedding_model": "opencv-sface",
+            "embedding_model": self.face_backend.get("backend", "opencv-sface"),
         }
 
     def assign_face_tracks(self, faces):
@@ -968,6 +994,10 @@ class LocalVisionRuntime:
             "emotion_confidence": emotion_confidence,
             "emotion_arousal": emotion_arousal,
             "emotion_backend": emotion_backend,
+            "face_backend": {key: self.face_backend.get(key) for key in
+                             ("backend", "label", "dimension", "threshold", "licence",
+                              "commercial_use", "available", "calibrated", "reason", "warning")
+                             if key in self.face_backend},
             "emotion_valid": emotion_valid,
             "face_orient": nearest["orientation"] if nearest else {"valid": False, "yaw_deg": 0.0, "pitch_deg": 0.0, "roll_deg": 0.0},
             "novelty": bool(novelty_labels),
@@ -1415,6 +1445,7 @@ async def main_async(args):
         args.object_interval,
         args.source_type,
         args.source_id,
+        args.face_backend,
     )
     runtime.start()
     runtime.attach_loop(asyncio.get_running_loop())
@@ -1443,6 +1474,9 @@ def main():
     parser.add_argument("--object-interval", type=float, default=0.5)
     parser.add_argument("--source-type", choices=["opencv", "realsense"], default="opencv")
     parser.add_argument("--source-id", default="")
+    parser.add_argument("--face-backend", choices=["sface", "arcface"], default=None,
+                        help="sface: Apache-2.0 权重，默认。arcface: buffalo_l w600k_r50，更准，"
+                             "但权重仅限非商业研究用途。也可用 VISION_FACE_BACKEND 设置。")
     args = parser.parse_args()
     asyncio.run(main_async(args))
 
