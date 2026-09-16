@@ -418,6 +418,7 @@ class LocalVisionRuntime:
         self.face_embedder, self.face_backend = face_embedder.create(model_dir, face_backend)
         self.face_recognizer = self.face_embedder
         self.identity_cache = []
+        self.face_templates = face_embedder.TemplateTracker()
         self.identity_interval_ms = int(os.environ.get("VISION_IDENTITY_INTERVAL_MS", "300"))
         print(f"face backend: {self.face_backend.get('label', self.face_backend['backend'])} "
               f"({self.face_backend.get('reason')})", flush=True)
@@ -625,7 +626,8 @@ class LocalVisionRuntime:
             stamp_ms = int(time.time() * 1000)
             identity = self.cached_identity(row, stamp_ms)
             if identity is None:
-                identity = self.timed(self.face_backend.get("backend", "face"), self.identify_face, frame, row)
+                identity = self.timed(self.face_backend.get("backend", "face"), self.identify_face,
+                                      frame, row, orient, stamp_ms)
                 self.remember_identity(row, stamp_ms, identity)
             results.append(
                 {
@@ -634,6 +636,8 @@ class LocalVisionRuntime:
                     "user_id": identity["user_id"],
                     "user_role": identity["user_role"],
                     "identity_similarity": identity["similarity"],
+                    "identity_quality": identity.get("identity_quality"),
+                    "identity_template_frames": identity.get("template_frames", 0),
                     "_embedding": identity.get("_embedding"),
                     "emotion_raw": emotion["score"],
                     "emotion_label": emotion["label"],
@@ -699,11 +703,22 @@ class LocalVisionRuntime:
         if len(self.identity_cache) > 16:
             del self.identity_cache[:-16]
 
-    def identify_face(self, frame, face_row):
-        embedding = self.face_embedding(frame, face_row)
-        if embedding is None:
-            return {"user_id": "stranger", "user_role": "stranger", "similarity": 0.0}
-        vector = np.asarray(embedding, dtype=np.float32)
+    def identify_face(self, frame, face_row, orientation=None, stamp_ms=0):
+        """Match against a template built from recent good frames, not one frame.
+
+        A frame that fails the quality gate does not update the template and does
+        not produce a decision: the result is marked unknown with the reason,
+        because guessing an identity from a blurred or profile face is what makes
+        remembered context attach to the wrong person.
+        """
+        import face_embedder
+        quality = face_embedder.face_quality(frame, face_row, orientation)
+        embedding = self.face_embedding(frame, face_row) if quality["usable"] else None
+        template = self.face_templates.update(face_row, embedding, stamp_ms or int(time.time() * 1000))
+        if template is None:
+            return {"user_id": "unknown", "user_role": "unknown", "similarity": 0.0,
+                    "identity_quality": quality, "template_frames": 0}
+        vector = np.asarray(template, dtype=np.float32)
         best = ("stranger", "stranger", 0.0)
         for user_id, entry in self.identities.items():
             saved = np.asarray(entry.get("embedding", []), dtype=np.float32)
@@ -713,9 +728,12 @@ class LocalVisionRuntime:
             if similarity > best[2]:
                 best = (user_id, str(entry.get("role") or "known"), similarity)
         threshold = float(self.face_backend.get("threshold", 0.38))
+        depth = self.face_templates.depth(face_row, stamp_ms or int(time.time() * 1000))
+        common = {"identity_quality": quality, "template_frames": depth,
+                  "_embedding": embedding if quality["usable"] else None}
         if best[2] < threshold:
-            return {"user_id": "stranger", "user_role": "stranger", "similarity": best[2], "_embedding": embedding}
-        return {"user_id": best[0], "user_role": best[1], "similarity": best[2], "_embedding": embedding}
+            return dict(common, user_id="stranger", user_role="stranger", similarity=best[2])
+        return dict(common, user_id=best[0], user_role=best[1], similarity=best[2])
 
     def enroll_nearest_face(self, user_id, user_role="known", require_single=False, dry_run=False, started_ms=0, ended_ms=0):
         user_id = str(user_id or "").strip()

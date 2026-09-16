@@ -27,7 +27,30 @@
 
 详细历史与最新追加记录请同时阅读本项目AGENTS.md，冲突以用户最新指令为准。
 
-## 可插拔注意力（第四版，2026-09-16 最新）
+## 统一注意力竞争（第五版，2026-09-16 最新）
+理论链已全部落地：Itti-Koch 显著性 → Biased Competition → Reynolds-Heeger 除性归一化（v2，归一化池跨模态耦合 κ=0.35）
+→ Selective Tuning（v2 方位抑制环 + workspace soft-WTA 压制非赢家）→ Habituation/IOR/Hysteresis → Global Workspace → Brain。
+唯一没做的是层级 Selective Tuning：候选空间是扁平的 person/track/object，没有真正的 part-whole 层级，硬套是空架子。
+输入源五个（8092 可勾选，存 .run/attention-config.json）：audio_visual、memory_context、linguistic_context、
+cross_session_memory、internal_state（默认关闭，无生产者）。关闭=消融该通道证据，不是关硬件或安全反射。
+算法为独立 .so（编译 bash scripts/build_attention_plugins.sh）：av_memory_language_v1（默认，自上而下相加）、
+av_memory_language_v2（乘性注意场 + 跨模态池 + 抑制环）、builtin_audio_visual_v1（仅视听基线）。
+v1/v2 跑同一套行为用例全过；现场优劣未比较，所以默认仍是 v1。缺 .so 不阻断启动，回退基线并报错。
+Global Workspace（global_workspace.py）是统一订阅点也是认知层竞争：soft-WTA(share=a²/Σa²) + 有限容量 4 +
+urgency≥0.7 抢占；非感知候选（记忆、惊跳）在这里竞争，因为它们没有模态。
+入口 GET /api/workspace、?since=N 回放、/api/workspace/stream (SSE)、ROS /attention/workspace。订阅者落后丢帧并计数。
+双向：Memory→Attention 用 memory_candidates.py（保守：只提未完成的事、每 5 分钟一次、人在场、安静 3 秒、
+同一件事只提一次，ATTENTION_MEMORY_EVENTS=0 可关）；Brain→Attention 用 attention_memory.goals 作 top-down bias
+（awaiting_answer/holding_floor/deferred_turn/greet_owner，只偏置不放行）。
+记忆通道整体乘以识别置信度；角色（主人/陌生人）不进交流意愿层，只留在第一层 importance 影响「看哪里」。
+模型：声纹 ERes2NetV2（192 维）；人脸走商用路线，默认 sface(Apache-2.0) + 质量门槛 + 5 帧模板均值，
+arcface(buffalo_l) 已下载但权重仅限非商业研究，--face-backend arcface 可切；身份识别 300ms 节流。
+Attention 164、Brain 62、Vision 23、C++ 4 个测试目标、页面 DOM 通过；
+scripts/verify_attention_algorithm.py 为不开硬件的端到端离线检查。
+权重与阈值是工程先验，未做现场 ROC 标定；论文数字不能当本机准确率。
+完整研究依据/协议/限制见 /Applications/声音/可插拔仿生注意力与论文依据.txt。
+
+## 可插拔注意力（第四版历史，2026-09-16）
 输入源五个（8092 可勾选，存 .run/attention-config.json）：audio_visual、memory_context、linguistic_context、
 cross_session_memory、internal_state（默认关闭，无生产者）。关闭=消融该通道证据，不是关硬件或安全反射。
 算法为独立 .so（C ABI 见 include/robot_attention_perception/attention_plugin_abi.h，编译 bash scripts/build_attention_plugins.sh）：

@@ -129,3 +129,97 @@ def create(model_dir, backend=None):
     if not spec["commercial_use"]:
         info["warning"] = "该权重仅限非商业研究用途；用于产品前请改回 sface 或取得许可。"
     return embedder, info
+
+
+# Quality gating and multi-frame templates. With a licence-clean but weaker
+# backend this is where most of the usable accuracy comes from: averaging a few
+# good frames cuts embedding noise, and refusing to decide on a bad frame is
+# better than guessing. Thresholds are engineering starting points, not measured.
+MIN_FACE_PIXELS = 72          # a face smaller than this carries too little detail
+MIN_DETECTION_SCORE = 0.85
+MIN_SHARPNESS = 25.0          # Laplacian variance; below this the crop is blurred
+MAX_YAW_DEGREES = 40.0
+MAX_PITCH_DEGREES = 30.0
+TEMPLATE_FRAMES = 5
+
+
+def face_quality(frame, face_row, orientation=None):
+    """How much this particular frame is worth trusting, and why not if it is not."""
+    row = np.asarray(face_row, dtype=np.float32).reshape(-1)
+    width, height = float(row[2]), float(row[3])
+    score = float(row[14]) if row.size >= 15 else 1.0
+    reasons = []
+    size = min(width, height)
+    if size < MIN_FACE_PIXELS:
+        reasons.append("face_too_small")
+    if score < MIN_DETECTION_SCORE:
+        reasons.append("weak_detection")
+
+    yaw = abs(float((orientation or {}).get("yaw", 0.0) or 0.0))
+    pitch = abs(float((orientation or {}).get("pitch", 0.0) or 0.0))
+    if yaw > MAX_YAW_DEGREES or pitch > MAX_PITCH_DEGREES:
+        reasons.append("not_frontal_enough")
+
+    sharpness = 0.0
+    x, y = max(0, int(row[0])), max(0, int(row[1]))
+    crop = frame[y:y + max(1, int(height)), x:x + max(1, int(width))]
+    if crop.size:
+        grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        sharpness = float(cv2.Laplacian(grey, cv2.CV_64F).var())
+        if sharpness < MIN_SHARPNESS:
+            reasons.append("blurred")
+
+    usable = not reasons
+    quality = 0.0 if not usable else min(1.0, (min(size / (MIN_FACE_PIXELS * 2), 1.0) * 0.4 +
+                                               min(sharpness / (MIN_SHARPNESS * 4), 1.0) * 0.3 +
+                                               max(0.0, 1.0 - yaw / MAX_YAW_DEGREES) * 0.3))
+    return {"usable": usable, "quality": round(quality, 4), "reasons": reasons,
+            "size_px": round(size, 1), "sharpness": round(sharpness, 1),
+            "yaw": round(yaw, 1), "detection_score": round(score, 3)}
+
+
+class TemplateTracker:
+    """Averages recent good embeddings of the same face into one template.
+
+    A single frame's embedding is noisy; the mean of a few good ones is not. Only
+    frames that passed the quality gate are admitted, so a blurred or profile
+    frame cannot drag the template away from the person.
+    """
+
+    def __init__(self, frames=TEMPLATE_FRAMES, slots=8):
+        self.frames = frames
+        self.slots = slots
+        self.entries = []
+
+    def _match(self, centre, span):
+        for entry in self.entries:
+            if abs(entry["centre"][0] - centre[0]) < span * 0.5 and abs(entry["centre"][1] - centre[1]) < span * 0.5:
+                return entry
+        return None
+
+    def update(self, face_row, embedding, stamp_ms, ttl_ms=2000):
+        """Returns the averaged template for this face, or None if nothing yet."""
+        row = np.asarray(face_row, dtype=np.float32).reshape(-1)
+        centre = (float(row[0] + row[2] / 2), float(row[1] + row[3] / 2))
+        span = max(float(row[2]), float(row[3]), 1.0)
+        self.entries = [entry for entry in self.entries if 0 <= stamp_ms - entry["stamp_ms"] < ttl_ms]
+        entry = self._match(centre, span)
+        if entry is None:
+            entry = {"centre": centre, "samples": []}
+            self.entries.append(entry)
+            del self.entries[:-self.slots]
+        entry["centre"] = centre
+        entry["stamp_ms"] = stamp_ms
+        if embedding is not None:
+            entry["samples"].append(np.asarray(embedding, dtype=np.float32))
+            del entry["samples"][:-self.frames]
+        if not entry["samples"]:
+            return None
+        return _normalise(np.mean(entry["samples"], axis=0))
+
+    def depth(self, face_row, stamp_ms, ttl_ms=2000):
+        row = np.asarray(face_row, dtype=np.float32).reshape(-1)
+        centre = (float(row[0] + row[2] / 2), float(row[1] + row[3] / 2))
+        span = max(float(row[2]), float(row[3]), 1.0)
+        entry = self._match(centre, span)
+        return len(entry["samples"]) if entry and 0 <= stamp_ms - entry["stamp_ms"] < ttl_ms else 0
