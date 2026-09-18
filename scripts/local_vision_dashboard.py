@@ -467,6 +467,8 @@ class LocalVisionRuntime:
         # people who cross from swapping ids.
         self.face_tracker_backend = str(face_tracker or os.environ.get("VISION_FACE_TRACKER", "greedy")).lower()
         self.face_tracker, self.face_tracker_error = None, ""
+        self.track_history = deque(maxlen=4096)
+        self.max_faces_seen = 0
         if self.face_tracker_backend == "bytetrack":
             try:
                 from trackers import ByteTrackTracker
@@ -914,6 +916,37 @@ class LocalVisionRuntime:
             if now - state["seen_at"] <= 2.0
         }
 
+    # A minute is long enough that one person sitting still should account for
+    # exactly one id, and short enough to see a switch happen.
+    CHURN_WINDOW_S = 60
+
+    def track_churn(self, faces):
+        """How many different ids one face has been given lately.
+
+        The point of a tracker is that a person keeps their id. Whether the
+        greedy box matcher or ByteTrack does that better on this camera, in
+        this room, is a question with a number: over a minute, how many
+        distinct ids appeared for how many faces. One person who collects six
+        ids in a minute is six chances for the wrong name. Without this the
+        choice of tracker is a matter of opinion.
+        """
+        now = time.time()
+        for face in faces:
+            if face.get("track_id"):
+                self.track_history.append((now, str(face["track_id"])))
+        while self.track_history and now - self.track_history[0][0] > self.CHURN_WINDOW_S:
+            self.track_history.popleft()
+        ids = {identifier for _, identifier in self.track_history}
+        faces_seen = max(len(faces), 1) if faces else 0
+        self.max_faces_seen = max(getattr(self, "max_faces_seen", 0), len(faces))
+        return {"backend": self.face_tracker_backend, "window_s": self.CHURN_WINDOW_S,
+                "distinct_ids": len(ids), "faces_now": len(faces),
+                "most_faces_at_once": self.max_faces_seen,
+                # One id per person present is the floor; anything above it is
+                # the tracker losing somebody and starting again.
+                "ids_per_face": round(len(ids) / self.max_faces_seen, 2) if self.max_faces_seen else None,
+                "error": self.face_tracker_error}
+
     def _assign_bytetrack_ids(self, faces):
         """Ask the motion tracker who these boxes are; return the ones it would not name."""
         import numpy as np
@@ -1185,7 +1218,7 @@ class LocalVisionRuntime:
                              ("backend", "label", "dimension", "threshold", "licence",
                               "commercial_use", "available", "calibrated", "reason", "warning")
                              if key in self.face_backend},
-            "face_tracker": {"backend": self.face_tracker_backend, "error": self.face_tracker_error},
+            "face_tracker": self.track_churn(faces),
             "emotion_valid": emotion_valid,
             "face_orient": nearest["orientation"] if nearest else {"valid": False, "yaw_deg": 0.0, "pitch_deg": 0.0, "roll_deg": 0.0},
             "novelty": bool(novelty_labels),

@@ -157,3 +157,56 @@ class ByteTrackFaceTrackingTest(unittest.TestCase):
         runtime.assign_face_tracks(faces)
         self.assertTrue(all(face.get("track_id") for face in faces))
         self.assertIn("boom", runtime.face_tracker_error)
+
+
+class ChurnMetricTest(unittest.TestCase):
+    """跟踪器换了几次 ID，是个可以比较的数字。
+
+    One person sitting still should account for exactly one id. Six ids in a
+    minute is six chances for the wrong name, and without counting them the
+    choice between the greedy matcher and ByteTrack is a matter of opinion.
+    """
+
+    def runtime(self):
+        from collections import deque
+        runtime = LocalVisionRuntime.__new__(LocalVisionRuntime)
+        runtime.face_tracker_backend = "greedy"
+        runtime.face_tracker_error = ""
+        runtime.track_history = deque(maxlen=4096)
+        runtime.max_faces_seen = 0
+        return runtime
+
+    def test_one_person_one_id_is_the_floor(self):
+        runtime = self.runtime()
+        for _ in range(30):
+            churn = runtime.track_churn([{"track_id": "face_track_0001"}])
+        self.assertEqual(churn["distinct_ids"], 1)
+        self.assertEqual(churn["ids_per_face"], 1.0)
+
+    def test_a_tracker_that_keeps_losing_somebody_scores_worse(self):
+        runtime = self.runtime()
+        for index in range(6):
+            churn = runtime.track_churn([{"track_id": f"face_track_{index:04d}"}])
+        self.assertEqual(churn["distinct_ids"], 6)
+        self.assertEqual(churn["ids_per_face"], 6.0)
+
+    def test_two_people_are_allowed_two_ids(self):
+        runtime = self.runtime()
+        for _ in range(10):
+            churn = runtime.track_churn([{"track_id": "face_track_0001"}, {"track_id": "face_track_0002"}])
+        self.assertEqual(churn["ids_per_face"], 1.0)
+        self.assertEqual(churn["most_faces_at_once"], 2)
+
+    def test_an_empty_room_reports_nothing_rather_than_dividing_by_zero(self):
+        runtime = self.runtime()
+        churn = runtime.track_churn([])
+        self.assertEqual(churn["faces_now"], 0)
+        self.assertIsNone(churn["ids_per_face"])
+
+    def test_ids_from_last_hour_do_not_count(self):
+        import time as clock
+        runtime = self.runtime()
+        runtime.track_churn([{"track_id": "old"}])
+        runtime.track_history[0] = (clock.time() - 3600, "old")
+        churn = runtime.track_churn([{"track_id": "new"}])
+        self.assertEqual(churn["distinct_ids"], 1)
