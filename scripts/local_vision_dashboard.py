@@ -733,7 +733,13 @@ class LocalVisionRuntime:
         if len(results)==1 and results[0].get("_embedding") and results[0]["score"]>=.9:
             face=results[0]
             with self.lock:
-                self.registration_faces.append((int(time.time()*1000),face["track_id"],face["_embedding"],bool(face.get("lip_motion_valid") and face.get("lip_motion"))))
+                # Tri-state, not a boolean: True 嘴在动, False 嘴没动, None 没测到.
+                # "Not measured" is not "not moving" — with the landmark model
+                # silent about the mouth, demanding two moving samples made every
+                # enrolment fail with 「请保持面对镜头」 while the person was
+                # looking straight at it, talking.
+                moving = bool(face.get("lip_motion")) if face.get("lip_motion_valid") else None
+                self.registration_faces.append((int(time.time()*1000),face["track_id"],face["_embedding"],moving))
         return results
 
     def load_identities(self):
@@ -832,9 +838,17 @@ class LocalVisionRuntime:
             return {"success": False, "message": "no face is available"}
         if require_single and len(faces) != 1:
             return {"success": False, "message": "请只保留注册者一张人脸在镜头内"}
+        # Which face: by its box track, or by the person id the rest of the
+        # stack knows it as (vision_guest_0007 / a name). The published people
+        # carry the person id, not the box track, so an enrolment driven by a
+        # conversation has only that to point with.
         wanted = str(track_id or "")
         if wanted:
             face = next((item for item in faces if str(item.get("track_id")) == wanted), None)
+            if face is None:
+                face = next((item for item in faces
+                             if self.stable_person_id(item.get("user_id"), item.get("track_id"),
+                                                      item.get("guest_id")) == wanted), None)
             if face is None:
                 return {"success": False, "message": "那张脸现在不在画面里"}
         else:
@@ -844,8 +858,12 @@ class LocalVisionRuntime:
             with self.lock:
                 matched=[(e,moving) for t,k,e,moving in self.registration_faces if k==face.get("track_id") and max(started_ms,int(time.time()*1000)-5000)<=t<=ended_ms+250]
                 samples=[e for e,moving in matched]
-            if len(samples)<5 or sum(bool(moving) for e,moving in matched)<2:
+            measured=[moving for e,moving in matched if moving is not None]
+            if len(samples)<5:
                 return {"success":False,"message":"请保持面对镜头，完整说一遍注册话术"}
+            if measured and sum(bool(moving) for moving in measured)<2:
+                # 测得到嘴型、而且确实没在动：这张脸不是刚才说话的那个人。
+                return {"success":False,"message":"这张脸刚才没有在说话，请注册者自己说一句"}
             vectors=np.asarray(samples,dtype=np.float32)
             center=vectors.mean(axis=0);center/=max(float(np.linalg.norm(center)),1e-6)
             if float(np.min(vectors@center))<.7:
