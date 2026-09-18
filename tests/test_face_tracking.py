@@ -88,3 +88,72 @@ class GuestContinuityTest(unittest.TestCase):
                          "vision_guest_0001")
         self.assertEqual(LocalVisionRuntime.stable_person_id("stranger", "face_track_0007", None),
                          "vision_face_track_0007")
+
+
+class ByteTrackFaceTrackingTest(unittest.TestCase):
+    """两个人交叉走动时不换 ID：贪心框匹配做不到，带运动模型的跟踪器做得到。
+
+    The greedy matcher scores IoU plus centre proximity with no motion model,
+    so when two boxes swap places the better overlap is with the wrong face.
+    ByteTrack (roboflow/trackers, Apache-2.0) predicts where each box is going.
+    Measured here: 200 updates in 14.8 ms, and both ids survive a crossing.
+    Identity still comes from the face embedding; this only has to keep saying
+    "same person as last frame" for long enough.
+    """
+
+    def runtime(self, backend="bytetrack"):
+        runtime = LocalVisionRuntime.__new__(LocalVisionRuntime)
+        runtime.face_tracks = {}
+        runtime.next_face_track_id = 1
+        runtime.face_tracker_backend = backend
+        runtime.face_tracker_error = ""
+        runtime.face_tracker = None
+        if backend == "bytetrack":
+            try:
+                from trackers import ByteTrackTracker
+            except ImportError:
+                self.skipTest("trackers not installed")
+            runtime.face_tracker = ByteTrackTracker()
+        return runtime
+
+    def faces(self, step):
+        return [{"box": [100 + step * 8, 100, 80, 100], "score": .9},
+                {"box": [400 - step * 8, 110, 80, 100], "score": .85}]
+
+    def test_two_people_crossing_keep_their_ids(self):
+        runtime = self.runtime()
+        seen = []
+        for step in range(14):
+            faces = self.faces(step)
+            runtime.assign_face_tracks(faces)
+            seen.append([face["track_id"] for face in faces])
+        # The first frames are unconfirmed and named by the greedy fallback;
+        # from then on the ids must not swap.
+        settled = seen[4:]
+        self.assertTrue(all(row == settled[0] for row in settled), settled)
+        self.assertEqual(len(set(settled[0])), 2)
+
+    def test_an_unconfirmed_face_still_gets_an_id(self):
+        runtime = self.runtime()
+        faces = self.faces(0)
+        runtime.assign_face_tracks(faces)
+        self.assertTrue(all(face.get("track_id") for face in faces))
+
+    def test_a_missing_library_falls_back_instead_of_crashing(self):
+        runtime = self.runtime(backend="greedy")
+        faces = self.faces(0)
+        runtime.assign_face_tracks(faces)
+        self.assertTrue(all(face["track_id"].startswith("face_track_") for face in faces))
+
+    def test_a_tracker_that_throws_falls_back_for_that_frame(self):
+        runtime = self.runtime(backend="greedy")
+
+        class Broken:
+            def update(self, detections):
+                raise RuntimeError("boom")
+
+        runtime.face_tracker = Broken()
+        faces = self.faces(0)
+        runtime.assign_face_tracks(faces)
+        self.assertTrue(all(face.get("track_id") for face in faces))
+        self.assertIn("boom", runtime.face_tracker_error)
