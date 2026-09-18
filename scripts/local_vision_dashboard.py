@@ -816,7 +816,12 @@ class LocalVisionRuntime:
             return dict(common, user_id="stranger", user_role="stranger", similarity=best[2], guest_id=guest)
         return dict(common, user_id=best[0], user_role=best[1], similarity=best[2])
 
-    def enroll_nearest_face(self, user_id, user_role="known", require_single=False, dry_run=False, started_ms=0, ended_ms=0):
+    def enroll_nearest_face(self, user_id, user_role="known", require_single=False, dry_run=False, started_ms=0, ended_ms=0, track_id=""):
+        """Enrol a face. `track_id` names *which* face, for the case where the
+        robot is learning somebody in a room with other people in it: the
+        guided flow asks everybody else to step out, and an enrolment that
+        happens in the middle of a conversation cannot.
+        """
         user_id = str(user_id or "").strip()
         if not user_id:
             return {"success": False, "message": "user_id is required"}
@@ -827,9 +832,15 @@ class LocalVisionRuntime:
             return {"success": False, "message": "no face is available"}
         if require_single and len(faces) != 1:
             return {"success": False, "message": "请只保留注册者一张人脸在镜头内"}
-        face = faces[0]
+        wanted = str(track_id or "")
+        if wanted:
+            face = next((item for item in faces if str(item.get("track_id")) == wanted), None)
+            if face is None:
+                return {"success": False, "message": "那张脸现在不在画面里"}
+        else:
+            face = faces[0]
         embedding = None
-        if require_single:
+        if require_single or wanted:
             with self.lock:
                 matched=[(e,moving) for t,k,e,moving in self.registration_faces if k==face.get("track_id") and max(started_ms,int(time.time()*1000)-5000)<=t<=ended_ms+250]
                 samples=[e for e,moving in matched]
@@ -1614,7 +1625,7 @@ def make_app(runtime, web_dir):
     @routes.post("/api/enroll")
     async def api_enroll(request):
         data = await request.json()
-        result = runtime.enroll_nearest_face(data.get("user_id"), data.get("user_role", "known"), bool(data.get("require_single")), bool(data.get("dry_run")), int(data.get("started_ms") or 0), int(data.get("ended_ms") or 0))
+        result = runtime.enroll_nearest_face(data.get("user_id"), data.get("user_role", "known"), bool(data.get("require_single")), bool(data.get("dry_run")), int(data.get("started_ms") or 0), int(data.get("ended_ms") or 0), str(data.get("track_id") or ""))
         return web.json_response(result, status=200 if result.get("success") else 400)
 
     @routes.get("/ws")
