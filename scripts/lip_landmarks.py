@@ -1,4 +1,9 @@
 """Model-based mouth geometry; motion is evidence, not a speech classifier."""
+# The face detector reports at 0.80; requiring more here made lip motion
+# permanently invalid on a camera whose scores sit at 0.81 to 0.83, which
+# silently removed audio-visual binding everywhere downstream.
+import os
+FACE_SCORE=float(os.environ.get('VISION_LIP_FACE_SCORE','0.80'))
 from collections import deque
 import time
 import cv2
@@ -55,7 +60,7 @@ class LipLandmarker:
         for face in faces:
             x,y,w,h=face['box'];orient=face['orientation'];points=None
             matches=[i for i,m in enumerate(meshes) if i not in used and x<=m[1,0]<=x+w and y<=m[1,1]<=y+h]
-            valid=(len(matches)==1 and face['score']>=.85 and min(w,h)>=64 and orient.get('valid')
+            valid=(len(matches)==1 and face['score']>=FACE_SCORE and min(w,h)>=64 and orient.get('valid')
                    and abs(orient.get('yaw_deg',90))<=30 and abs(orient.get('pitch_deg',90))<=25)
             if valid:
                 index=matches[0];used.add(index);points=meshes[index]

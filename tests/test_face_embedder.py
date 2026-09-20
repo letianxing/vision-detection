@@ -147,3 +147,45 @@ class TemplateTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HeadPoseTests(unittest.TestCase):
+    """Yaw came from the nose's offset inside the detection box, which is not
+    centred on the nose and jitters, so a person facing the camera measured
+    around 45 degrees and every path needing eye contact went dead."""
+
+    def runtime(self):
+        from local_vision_dashboard import LocalVisionRuntime
+        return LocalVisionRuntime.__new__(LocalVisionRuntime)
+
+    def landmarks(self, nose_offset=0.0):
+        eye_gap = 60.0
+        right_eye, left_eye = (200.0, 200.0), (200.0 + eye_gap, 200.0)
+        nose = (200.0 + eye_gap / 2 + nose_offset, 200.0 + 70 * 0.52)
+        return [right_eye, left_eye, nose, (205.0, 270.0), (255.0, 270.0)]
+
+    def test_a_face_looking_straight_ahead_reads_as_straight_ahead(self):
+        pose = self.runtime().estimate_orientation((150, 160, 160, 150), self.landmarks())
+        self.assertTrue(pose['valid'])
+        self.assertAlmostEqual(pose['yaw_deg'], 0.0, places=6)
+
+    def test_the_detection_box_no_longer_affects_the_answer(self):
+        runtime = self.runtime()
+        marks = self.landmarks()
+        centred = runtime.estimate_orientation((150, 160, 160, 150), marks)
+        shifted = runtime.estimate_orientation((190, 160, 160, 150), marks)
+        self.assertAlmostEqual(centred['yaw_deg'], shifted['yaw_deg'], places=6)
+
+    def test_turning_away_is_still_measured_and_ordered(self):
+        runtime = self.runtime()
+        previous = 0.0
+        for offset in (5.0, 12.0, 20.0):
+            yaw = abs(runtime.estimate_orientation((150, 160, 160, 150), self.landmarks(offset))['yaw_deg'])
+            self.assertGreater(yaw, previous)
+            previous = yaw
+
+    def test_landmarks_too_small_to_measure_are_reported_invalid(self):
+        tiny = [(200.0, 200.0), (204.0, 200.0), (202.0, 203.0), (201.0, 206.0), (203.0, 206.0)]
+        pose = self.runtime().estimate_orientation((198, 198, 10, 10), tiny)
+        self.assertFalse(pose['valid'])
+        self.assertIn('too_small', pose['reason'])
