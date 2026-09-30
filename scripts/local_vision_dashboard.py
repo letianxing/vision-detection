@@ -17,6 +17,7 @@ from aiohttp import WSMsgType, web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from lip_landmarks import LipLandmarker
+from asd_capture import FaceWindows
 from flash_events import FlashDetector
 
 from capture_sources import create_capture_source, list_realsense_sources
@@ -436,6 +437,10 @@ class LocalVisionRuntime:
         self.latest_state = None
         self.latest_jpeg = None
         self.latest_frame = None
+        self.latest_frame_ms = 0
+        self.latest_faces_ms = 0
+        self.asd_capture_generation = 0
+        self.asd_faces = FaceWindows()
         self.latest_depth = None
         self.latest_depth_source = "none"
         self.latest_detections = []
@@ -545,12 +550,14 @@ class LocalVisionRuntime:
 
     def stop(self):
         self.running = False
+        self.asd_faces.clear()
         capture_thread = getattr(self, "capture_thread", None)
         inference_thread = getattr(self, "inference_thread", None)
         if capture_thread is not None:
             capture_thread.join(timeout=1.0)
         if inference_thread is not None:
             inference_thread.join(timeout=1.0)
+        self.asd_faces.clear()
         with self.lock:
             self.latest_frame = None
             self.latest_depth = None
@@ -584,6 +591,12 @@ class LocalVisionRuntime:
             with self.lock:
                 desired_key = (self.source_type, self.source_id)
             if source is None or desired_key != active_key:
+                self.asd_faces.clear()
+                with self.lock:
+                    self.asd_capture_generation += 1
+                    self.latest_faces = []
+                    self.latest_faces_ms = 0
+                    self.latest_frame = None
                 if source is not None:
                     source.release()
                 try:
@@ -603,6 +616,7 @@ class LocalVisionRuntime:
             if not ok or sample is None:
                 time.sleep(0.05)
                 continue
+            capture_ms = int(time.time()*1000)
             frame = sample.color_bgr
             frame = self.resize_frame(frame)
             depth = sample.depth_m
@@ -611,12 +625,18 @@ class LocalVisionRuntime:
 
             with self.lock:
                 self.latest_frame = frame.copy()
+                self.latest_frame_ms = capture_ms
                 self.latest_depth = None if depth is None else depth.copy()
                 self.latest_depth_source = sample.depth_source
                 detections = list(self.latest_detections)
                 faces = list(self.latest_faces)
                 hands = list(self.latest_hands)
                 state = self.latest_state
+                faces_ms = self.latest_faces_ms
+
+            self.asd_faces.append(capture_ms, frame,
+                [(self.stable_person_id(f['user_id'],f['track_id'],f.get('guest_id')),
+                  f['track_id'],f['box']) for f in faces], faces_ms)
 
             annotated = self.annotate(frame, detections, faces, hands, state)
             ok, encoded = cv2.imencode(
@@ -642,6 +662,8 @@ class LocalVisionRuntime:
             loop_start = time.time()
             with self.lock:
                 frame = None if self.latest_frame is None else self.latest_frame.copy()
+                frame_ms = self.latest_frame_ms
+                capture_generation = self.asd_capture_generation
                 depth = None if self.latest_depth is None else self.latest_depth.copy()
                 depth_source = self.latest_depth_source
             if frame is None:
@@ -650,9 +672,12 @@ class LocalVisionRuntime:
 
             state, detections, faces, hand_result = self.process_frame(frame, depth, depth_source)
             with self.lock:
+                if capture_generation != self.asd_capture_generation:
+                    continue
                 self.latest_state = state
                 self.latest_detections = detections
                 self.latest_faces = faces
+                self.latest_faces_ms = frame_ms
                 self.latest_hands = hand_result["hands"]
             self.broadcast({"type": "state", "state": state})
             elapsed = time.time() - loop_start
@@ -1618,6 +1643,14 @@ def make_app(runtime, web_dir):
     @routes.get("/api/state")
     async def api_state(_request):
         return web.json_response({"state": runtime.snapshot_state()})
+
+    @routes.get('/api/asd-faces')
+    async def api_asd_faces(request):
+        if not runtime.running:
+            return web.json_response({'people':[], 'available':False,'reason':'vision_stopped'})
+        result = await asyncio.to_thread(runtime.asd_faces.window, int(time.time()*1000),
+                                        request.query.get('person_id',''))
+        return web.json_response(result)
 
     @routes.get("/api/cameras")
     async def api_cameras(_request):
